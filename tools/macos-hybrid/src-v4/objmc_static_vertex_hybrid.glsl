@@ -120,7 +120,7 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
                       : (ocCorner == 2) ? ocUv2
                                         : ocUv3;
 
-#if OC_HAS_SUBGROUP
+#ifdef GL_KHR_shader_subgroup_quad
         // Corner roles for the generated NORTH rectangle are:
         //   lane 2 = local (0,0), lane 1 = (1,0), lane 3 = (0,1).
         // Minecraft has already applied the complete display/entity transform to
@@ -192,7 +192,7 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
                 }
             }
         }
-#if OC_HAS_SUBGROUP
+#ifdef GL_KHR_shader_subgroup_quad
         // Exact-geometry path: UV is affine on the source face, so assigning the
         // decoded source UV at each real vertex lets fixed-function interpolation
         // do all per-fragment work. ocSurfaceMap stays zero and the fragment shader
