@@ -6,6 +6,7 @@ on:
       - agent/macos-hybrid-compat
     paths:
       - .github/workflows/apply-macos-hybrid.yml
+      - tools/macos-hybrid/**
   pull_request:
     branches:
       - main
@@ -33,67 +34,19 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Materialize compatibility tooling
+      - name: Restore upstream generated sources
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f tools/macos-hybrid/install.py ]; then
-            echo 'Compatibility tooling is already materialized.'
-          else
-            cat tools/macos-hybrid-payload/part-*.b64 > /tmp/macos-hybrid-tools.tar.gz.b64
-            base64 -d /tmp/macos-hybrid-tools.tar.gz.b64 > /tmp/macos-hybrid-tools.tar.gz
-            echo '438ac872a1c5ea8dd4484811c4209d8804edc686ffebb85a83f5438dd3e91c7f  /tmp/macos-hybrid-tools.tar.gz' | sha256sum -c -
-            mkdir -p tools/macos-hybrid
-            tar -xzf /tmp/macos-hybrid-tools.tar.gz -C tools/macos-hybrid
-          fi
-          rm -rf \
-            /tmp/macos-hybrid-tools.tar.gz \
-            /tmp/macos-hybrid-tools.tar.gz.b64 \
-            tools/macos-hybrid-payload \
-            tools/macos-hybrid-payload.tar.gz.b64
+          # Regenerate from the exact upstream revision this fork was validated
+          # against. Tooling lives outside these paths and remains on the branch.
+          git cat-file -e 6a85a1f30f5dd0843c656838c5ebca13f0e029ed^{commit}
+          git checkout 6a85a1f30f5dd0843c656838c5ebca13f0e029ed -- objcubed.js objcubed
+          rm -f HYBRID_SURFACE_PATCH.json
+          rm -rf tools/macos-hybrid-perf-v4
 
-      - name: Apply surface-v4 performance patch
-        id: perf-v4
-        shell: bash
-        run: |
-          set +e
-          : > perf-v4-apply.log
-          if compgen -G 'tools/macos-hybrid-perf-v4/part-*.b64' > /dev/null; then
-            cat tools/macos-hybrid-perf-v4/part-*.b64 > /tmp/perf-v4.patch.gz.b64
-            base64 -d /tmp/perf-v4.patch.gz.b64 > /tmp/perf-v4.patch.gz 2>> perf-v4-apply.log
-            status=$?
-            if [ "$status" -eq 0 ]; then
-              gzip -t /tmp/perf-v4.patch.gz >> perf-v4-apply.log 2>&1
-              status=$?
-            fi
-            if [ "$status" -eq 0 ]; then
-              echo "surface-v4 payload $(sha256sum /tmp/perf-v4.patch.gz | cut -d' ' -f1)" | tee -a perf-v4-apply.log
-              gzip -dc /tmp/perf-v4.patch.gz | patch -p2 >> perf-v4-apply.log 2>&1
-              status=$?
-            fi
-            if [ "$status" -eq 0 ]; then
-              rm -rf tools/macos-hybrid-perf-v4 /tmp/perf-v4.patch.gz /tmp/perf-v4.patch.gz.b64
-            fi
-          else
-            echo 'Surface-v4 performance patch is already materialized.' | tee -a perf-v4-apply.log
-            status=0
-          fi
-          cat perf-v4-apply.log
-          echo "status=$status" >> "$GITHUB_OUTPUT"
-          exit 0
-
-      - name: Upload surface-v4 patch diagnostics
-        uses: actions/upload-artifact@v4
-        with:
-          name: surface-v4-patch-log
-          path: perf-v4-apply.log
-          if-no-files-found: error
-
-      - name: Enforce surface-v4 patch result
-        if: steps.perf-v4.outputs.status != '0'
-        run: |
-          cat perf-v4-apply.log
-          exit 1
+      - name: Upgrade tooling to v1.3
+        run: python3 tools/macos-hybrid/optimize_v13.py
 
       - name: Apply backend to the real checkout
         run: python3 tools/macos-hybrid/install.py .
@@ -107,6 +60,9 @@ jobs:
           python3 tools/macos-hybrid/validate_actual.py
           python3 tools/macos-hybrid/tests/test_static_surface_math.py
           node tools/macos-hybrid/tests/test_surface_helper.mjs
+          grep -q 'ocBarycentricOwned' objcubed/assets/minecraft/shaders/include/objmc_static_fragment.glsl
+          grep -q 'ocPackedFlags' objcubed/assets/minecraft/shaders/include/objmc_main.glsl
+          grep -q 'ocSurfaceMap.w, ocLocalUv' objcubed/assets/minecraft/shaders/core/item.fsh
 
       - name: Install upstream test dependencies
         run: npm install --ignore-scripts --force
@@ -146,7 +102,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           zip -qr dist/obj-cubed-macos-hybrid.zip . \
-            -x '.git/*' 'node_modules/*' 'dist/*' 'upstream-tests.log' 'perf-v4-apply.log' '*.pre-hybrid-surface'
+            -x '.git/*' 'node_modules/*' 'dist/*' 'upstream-tests.log' '*.pre-hybrid-surface'
           sha256sum dist/obj-cubed-macos-hybrid.zip > dist/obj-cubed-macos-hybrid.zip.sha256
 
       - name: Upload patched repository ZIP
@@ -163,6 +119,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A -- \
+            .github/workflows/apply-macos-hybrid.yml \
             README.md \
             objcubed.js \
             objcubed \
@@ -173,7 +130,7 @@ jobs:
             echo 'No generated changes to commit.'
             exit 0
           fi
-          git commit -m 'Optimize static surface-v4 rendering'
+          git commit -m 'Fix NVIDIA seams and optimize static surface rendering'
           git push origin HEAD:agent/macos-hybrid-compat
 
       - name: Enforce upstream test result
