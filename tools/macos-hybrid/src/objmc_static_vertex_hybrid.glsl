@@ -1,6 +1,12 @@
 // OC_HYBRID_SURFACE_PATCH_v1_4
 // Static surface-v4 vertex path. Compact per-face metadata replaces the
 // position / UV / vertex-index streams used by surface-v3.
+//
+// Fast path on subgroup-capable backends: the four transformed carrier corners
+// are used as an affine basis and each rectangle corner is collapsed onto the
+// real source triangle/quad vertex. This restores exact raster geometry (no
+// bounding-rectangle overdraw or fragment discard) on NVIDIA/Vulkan/supporting
+// OpenGL, while macOS OpenGL keeps the subgroup-free clipped-rectangle path.
 bool ocStaticHandled = false;
 isCustom = 0;
 transition = 0.0;
@@ -105,6 +111,30 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
         vec2 ocUv2 = vec2(ocM[7].r * 256 + ocM[7].g, ocM[7].b * 256 + ocM[7].a) / 65535.0;
         vec2 ocUv3 = vec2(ocM[8].r * 256 + ocM[8].g, ocM[8].b * 256 + ocM[8].a) / 65535.0;
 
+        vec2 ocQSelf = (ocCorner == 0) ? ocQ0
+                     : (ocCorner == 1) ? ocQ1
+                     : (ocCorner == 2) ? ocQ2
+                                       : ocQ3;
+        vec2 ocUvSelf = (ocCorner == 0) ? ocUv0
+                      : (ocCorner == 1) ? ocUv1
+                      : (ocCorner == 2) ? ocUv2
+                                        : ocUv3;
+
+#ifdef GL_KHR_shader_subgroup_quad
+        // Corner roles for the generated NORTH rectangle are:
+        //   lane 2 = local (0,0), lane 1 = (1,0), lane 3 = (0,1).
+        // Minecraft has already applied the complete display/entity transform to
+        // those positions. Affine reconstruction therefore preserves scale.z,
+        // both rotations, shear and reflections while emitting the exact source
+        // triangle/quad. A padded triangle has q3==q2, so its second raster
+        // triangle becomes degenerate instead of shading the bounding rectangle.
+        vec3 ocCarrierOrigin = subgroupQuadBroadcast(Pos, 2);
+        vec3 ocCarrierX = subgroupQuadBroadcast(Pos, 1) - ocCarrierOrigin;
+        vec3 ocCarrierY = subgroupQuadBroadcast(Pos, 3) - ocCarrierOrigin;
+        Pos = ocCarrierOrigin + ocCarrierX * ocQSelf.x + ocCarrierY * ocQSelf.y;
+#else
+        // Apple OpenGL 4.1 fallback: keep the real-face bounding rectangle and
+        // clip it to the source polygon in the fragment shader.
         ocSurfaceCoord = (ocCorner == 0) ? vec2(1.0, 1.0)
                        : (ocCorner == 1) ? vec2(1.0, 0.0)
                        : (ocCorner == 2) ? vec2(0.0, 0.0)
@@ -118,6 +148,7 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
             float(ocVertexCount),
             float(ocPackedFlags)
         );
+#endif
 
         float ocTexTime = GameTime * 24000.0;
 #ifdef ENTITY
@@ -161,8 +192,17 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
                 }
             }
         }
+#ifdef GL_KHR_shader_subgroup_quad
+        // Exact-geometry path: UV is affine on the source face, so assigning the
+        // decoded source UV at each real vertex lets fixed-function interpolation
+        // do all per-fragment work. ocSurfaceMap stays zero and the fragment shader
+        // takes its normal one-sample path with no barycentric math or discard.
+        texCoord = (ocBase0 + ocUvSelf * vec2(ocSize)) / vec2(ocAtlasSize);
+        texCoord2 = (ocBase1 + ocUvSelf * vec2(ocSize)) / vec2(ocAtlasSize);
+#else
         texCoord = ocBase0 / vec2(ocAtlasSize);
         texCoord2 = ocBase1 / vec2(ocAtlasSize);
+#endif
     }
 } else if (ocMarker == ivec4(12, 34, 56, 255)) {
     // Stale surface-v3 carriers are incompatible with the compact layout.
