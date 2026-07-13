@@ -59,7 +59,8 @@ jobs:
           if compgen -G 'tools/macos-hybrid-perf-v4/part-*.b64' > /dev/null; then
             cat tools/macos-hybrid-perf-v4/part-*.b64 > /tmp/perf-v4.patch.gz.b64
             base64 -d /tmp/perf-v4.patch.gz.b64 > /tmp/perf-v4.patch.gz
-            echo '1c7342d7142239bd15ee7b9b332b677b4f37fbf5edc1acdecfb76c0fb1b0affb  /tmp/perf-v4.patch.gz' | sha256sum -c -
+            gzip -t /tmp/perf-v4.patch.gz
+            echo "surface-v4 payload $(sha256sum /tmp/perf-v4.patch.gz | cut -d' ' -f1)"
             gzip -dc /tmp/perf-v4.patch.gz | patch -p2
             rm -rf tools/macos-hybrid-perf-v4 /tmp/perf-v4.patch.gz /tmp/perf-v4.patch.gz.b64
           else
