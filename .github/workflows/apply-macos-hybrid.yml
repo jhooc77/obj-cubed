@@ -1,0 +1,178 @@
+name: Apply macOS hybrid backend
+
+on:
+  push:
+    branches:
+      - agent/macos-hybrid-compat
+    paths:
+      - .github/workflows/apply-macos-hybrid.yml
+      - tools/macos-hybrid/**
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: macos-hybrid-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/macos-hybrid-compat
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Record branch source and restore reproducible inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "SOURCE_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          git cat-file -e 6a85a1f30f5dd0843c656838c5ebca13f0e029ed^{commit}
+          git cat-file -e 07a39c71cbb7da4df06ddb0ab45f28fc5675e1ca^{commit}
+          git checkout 6a85a1f30f5dd0843c656838c5ebca13f0e029ed -- objcubed.js objcubed
+          rm -f HYBRID_SURFACE_PATCH.json
+          # Restore the known v1.2 installer/templates. optimize_v13.py itself was
+          # added later and remains sourced from the current branch.
+          git checkout 07a39c71cbb7da4df06ddb0ab45f28fc5675e1ca -- \
+            tools/macos-hybrid/install.py \
+            tools/macos-hybrid/src \
+            tools/macos-hybrid/validate_actual.py
+
+      - name: Generate seam-safe v1.3 base
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/macos-hybrid/optimize_v13.py
+          python3 tools/macos-hybrid/install.py .
+
+      - name: Apply compact surface-v1.4 performance backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/macos-hybrid/optimize_surface_v4.py .
+          # The validator evolves with the current branch; the deterministic base
+          # checkout above intentionally restores only the generator inputs.
+          git checkout "$SOURCE_HEAD" -- tools/macos-hybrid/validate_actual.py
+          # A second application must be a no-op apart from deterministic manifest writes.
+          python3 tools/macos-hybrid/optimize_surface_v4.py .
+
+      - name: Remove installer backups
+        run: find . -type f -name '*.pre-hybrid-surface' -delete
+
+      - name: Validate generated JavaScript and hybrid structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check objcubed.js
+          python3 tools/macos-hybrid/validate_actual.py
+          python3 tools/macos-hybrid/tests/test_static_surface_math.py
+          node tools/macos-hybrid/tests/test_surface_helper.mjs
+          node tools/macos-hybrid/tests/test_surface_v4_build.mjs
+          grep -q 'OC_STATIC_META_STRIDE = 10' objcubed.js
+          ! sed '/#if OC_HAS_SUBGROUP/,$d' objcubed/assets/minecraft/shaders/include/objmc_main.glsl | grep -Eq 'getvert\(|getpos\(|getuv\('
+          grep -q 'ocBarycentricOwned' objcubed/assets/minecraft/shaders/include/objmc_static_fragment.glsl
+          grep -q 'ocPackedFlags' objcubed/assets/minecraft/shaders/include/objmc_main.glsl
+          grep -q 'ocCarrierOrigin = subgroupQuadBroadcast' objcubed/assets/minecraft/shaders/include/objmc_main.glsl
+          grep -q 'vec4 ocColor0 = texture(Sampler0, ocSample0)' objcubed/assets/minecraft/shaders/core/item.fsh
+
+      - name: Install upstream test dependencies
+        run: npm install --ignore-scripts --force
+
+      - name: Run upstream tests and preserve diagnostics
+        id: upstream-tests
+        shell: bash
+        run: |
+          set +e
+          npm test > upstream-tests.log 2>&1
+          unit_status=$?
+          if [ -f test/validate-pack.mjs ]; then
+            npm run test:pack >> upstream-tests.log 2>&1
+            pack_status=$?
+          else
+            echo 'SKIP test:pack: test/validate-pack.mjs is absent in the upstream checkout.' >> upstream-tests.log
+            pack_status=0
+          fi
+          cat upstream-tests.log
+          if [ "$unit_status" -eq 0 ] && [ "$pack_status" -eq 0 ]; then
+            echo 'status=0' >> "$GITHUB_OUTPUT"
+          else
+            echo 'status=1' >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Upload upstream test diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-test-log
+          path: upstream-tests.log
+          if-no-files-found: error
+
+      - name: Build downloadable ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          zip -qr dist/obj-cubed-macos-hybrid.zip . \
+            -x '.git/*' 'node_modules/*' 'dist/*' 'upstream-tests.log' '*.pre-hybrid-surface'
+          sha256sum dist/obj-cubed-macos-hybrid.zip > dist/obj-cubed-macos-hybrid.zip.sha256
+
+      - name: Upload patched repository ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: obj-cubed-macos-hybrid-v1.4
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Commit generated source changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          generated_paths=(
+            .github/workflows/apply-macos-hybrid.yml
+            README.md
+            objcubed.js
+            objcubed
+            HYBRID_SURFACE_PATCH.json
+            tools/macos-hybrid
+          )
+          git add -A -- "${generated_paths[@]}"
+          if git diff --cached --quiet; then
+            echo 'No generated changes to commit.'
+            exit 0
+          fi
+          git commit -m 'Optimize static rendering with compact surface-v1.4 metadata'
+          if ! git push origin HEAD:agent/macos-hybrid-compat; then
+            # A concurrent regeneration can produce the same tree first. Treat
+            # equivalent generated output as success instead of a false red CI.
+            git fetch origin agent/macos-hybrid-compat
+            if git diff --quiet HEAD origin/agent/macos-hybrid-compat -- "${generated_paths[@]}"; then
+              echo 'Remote branch already contains equivalent generated output.'
+              exit 0
+            fi
+            echo 'Remote branch changed with non-equivalent generated output.'
+            exit 1
+          fi
+
+      - name: Enforce upstream test result
+        if: steps.upstream-tests.outputs.status != '0'
+        run: |
+          echo 'Upstream tests failed; inspect the upstream-test-log artifact.'
+          exit 1
