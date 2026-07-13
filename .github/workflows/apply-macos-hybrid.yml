@@ -64,10 +64,29 @@ jobs:
       - name: Install upstream test dependencies
         run: npm install --ignore-scripts --force
 
-      - name: Run upstream tests
+      - name: Run upstream tests and preserve diagnostics
+        id: upstream-tests
+        shell: bash
         run: |
-          npm test
-          npm run test:pack
+          set +e
+          npm test > upstream-tests.log 2>&1
+          unit_status=$?
+          npm run test:pack >> upstream-tests.log 2>&1
+          pack_status=$?
+          cat upstream-tests.log
+          if [ "$unit_status" -eq 0 ] && [ "$pack_status" -eq 0 ]; then
+            echo 'status=0' >> "$GITHUB_OUTPUT"
+          else
+            echo 'status=1' >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Upload upstream test diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-test-log
+          path: upstream-tests.log
+          if-no-files-found: error
 
       - name: Build downloadable ZIP
         shell: bash
@@ -75,7 +94,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           zip -qr dist/obj-cubed-macos-hybrid.zip . \
-            -x '.git/*' 'node_modules/*' 'dist/*' '*.pre-hybrid-surface'
+            -x '.git/*' 'node_modules/*' 'dist/*' 'upstream-tests.log' '*.pre-hybrid-surface'
           sha256sum dist/obj-cubed-macos-hybrid.zip > dist/obj-cubed-macos-hybrid.zip.sha256
 
       - name: Upload patched repository ZIP
@@ -104,3 +123,9 @@ jobs:
           fi
           git commit -m 'Add macOS hybrid static-surface backend'
           git push origin HEAD:agent/macos-hybrid-compat
+
+      - name: Enforce upstream test result
+        if: steps.upstream-tests.outputs.status != '0'
+        run: |
+          echo 'Upstream tests failed; inspect the upstream-test-log artifact.'
+          exit 1
