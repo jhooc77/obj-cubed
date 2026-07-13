@@ -45,7 +45,6 @@ jobs:
           echo "SOURCE_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           git cat-file -e 6a85a1f30f5dd0843c656838c5ebca13f0e029ed^{commit}
           git cat-file -e 07a39c71cbb7da4df06ddb0ab45f28fc5675e1ca^{commit}
-          # Always regenerate the distributable source from the pinned upstream.
           git checkout 6a85a1f30f5dd0843c656838c5ebca13f0e029ed -- objcubed.js objcubed
           rm -f HYBRID_SURFACE_PATCH.json
           # Restore the known v1.2 installer/templates. optimize_v13.py itself was
@@ -67,8 +66,6 @@ jobs:
         run: |
           set -euo pipefail
           python3 tools/macos-hybrid/optimize_surface_v4.py .
-          # Restore the v1.4 validator from the source branch; optimize_v13 only
-          # needed its older copy while upgrading the base tooling.
           git checkout "$SOURCE_HEAD" -- tools/macos-hybrid/validate_actual.py
           # A second application must be a no-op apart from deterministic manifest writes.
           python3 tools/macos-hybrid/optimize_surface_v4.py .
@@ -145,19 +142,31 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A -- \
-            .github/workflows/apply-macos-hybrid.yml \
-            README.md \
-            objcubed.js \
-            objcubed \
-            HYBRID_SURFACE_PATCH.json \
+          generated_paths=(
+            .github/workflows/apply-macos-hybrid.yml
+            README.md
+            objcubed.js
+            objcubed
+            HYBRID_SURFACE_PATCH.json
             tools/macos-hybrid
+          )
+          git add -A -- "${generated_paths[@]}"
           if git diff --cached --quiet; then
             echo 'No generated changes to commit.'
             exit 0
           fi
           git commit -m 'Optimize static rendering with compact surface-v1.4 metadata'
-          git push origin HEAD:agent/macos-hybrid-compat
+          if ! git push origin HEAD:agent/macos-hybrid-compat; then
+            # A concurrent regeneration can produce the same tree first. Treat
+            # equivalent generated output as success instead of a false red CI.
+            git fetch origin agent/macos-hybrid-compat
+            if git diff --quiet HEAD origin/agent/macos-hybrid-compat -- "${generated_paths[@]}"; then
+              echo 'Remote branch already contains equivalent generated output.'
+              exit 0
+            fi
+            echo 'Remote branch changed with non-equivalent generated output.'
+            exit 1
+          fi
 
       - name: Enforce upstream test result
         if: steps.upstream-tests.outputs.status != '0'
