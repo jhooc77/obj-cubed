@@ -6,6 +6,9 @@ on:
       - agent/macos-hybrid-compat
     paths:
       - .github/workflows/apply-macos-hybrid.yml
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
