@@ -45,6 +45,40 @@ def without_subgroup_branch(text: str) -> str:
     return text[:start] + text[outer_else_end:outer_end_start] + text[outer_end_end:]
 
 
+def without_extension_fast_paths(text: str, macro: str) -> str:
+    """Select the #else branch of every `#ifdef macro` block.
+
+    The static exact-geometry optimization intentionally uses subgroup calls inside
+    `#ifdef GL_KHR_shader_subgroup_quad`. On Apple OpenGL that macro is absent, so
+    validation of the no-subgroup source must discard those true branches before
+    checking that no lane operation remains.
+    """
+    opener = f"#ifdef {macro}"
+    pattern = re.compile(r"(?m)^\s*#(?P<kind>if|ifdef|ifndef|else|endif)\b.*$")
+    while True:
+        start = text.find(opener)
+        if start < 0:
+            return text
+        depth = 0
+        else_start = else_end = None
+        end_start = end_end = None
+        for match in pattern.finditer(text, start):
+            kind = match.group("kind")
+            if kind in {"if", "ifdef", "ifndef"}:
+                depth += 1
+            elif kind == "else" and depth == 1 and else_start is None:
+                else_start, else_end = match.start(), match.end()
+            elif kind == "endif":
+                depth -= 1
+                if depth == 0:
+                    end_start, end_end = match.start(), match.end()
+                    break
+        if end_start is None:
+            die(f"malformed #ifdef {macro} block")
+        replacement = text[else_end:end_start] if else_start is not None else ""
+        text = text[:start] + replacement + text[end_end:]
+
+
 plugin = ROOT / "objcubed.js"
 main = ROOT / "objcubed/assets/minecraft/shaders/include/objmc_main.glsl"
 if not plugin.exists() or not main.exists():
@@ -75,6 +109,8 @@ for forbidden in ("getvert(", "getpos(", "getuv("):
         die(f"legacy fetch remains in static-v4 path: {forbidden}")
 if "ocPackedFlags" not in prefix:
     die("v1.3 deterministic edge-owner flags were not preserved")
+if "ocCarrierOrigin = subgroupQuadBroadcast" not in prefix:
+    die("subgroup-capable exact static geometry fast path missing")
 if "staticSurface: !(this.hasAnims" not in plugin_text:
     die("automatic static selection missing")
 if "!cbParts.includes('scale')" not in plugin_text:
@@ -92,6 +128,7 @@ if "BOX-PACKING" not in main_text:
 if "legacy decoder fixture" in main_text:
     die("fixture decoder was accidentally installed")
 no_subgroup = without_subgroup_branch(main_text)
+no_subgroup = without_extension_fast_paths(no_subgroup, "GL_KHR_shader_subgroup_quad")
 if "subgroupQuadBroadcast" in no_subgroup:
     die("subgroup call remains in macOS OpenGL preprocessing path")
 
