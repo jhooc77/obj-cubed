@@ -38,8 +38,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Regenerate from the exact upstream revision this fork was validated
-          # against. Tooling lives outside these paths and remains on the branch.
           git cat-file -e 6a85a1f30f5dd0843c656838c5ebca13f0e029ed^{commit}
           git checkout 6a85a1f30f5dd0843c656838c5ebca13f0e029ed -- objcubed.js objcubed
           rm -f HYBRID_SURFACE_PATCH.json
@@ -124,8 +122,7 @@ jobs:
             objcubed.js \
             objcubed \
             HYBRID_SURFACE_PATCH.json \
-            tools/macos-hybrid \
-            tools/macos-hybrid-perf-v4
+            tools/macos-hybrid
           if git diff --cached --quiet; then
             echo 'No generated changes to commit.'
             exit 0
