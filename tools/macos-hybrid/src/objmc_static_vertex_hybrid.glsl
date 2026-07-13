@@ -2,11 +2,11 @@
 // Static surface-v4 vertex path. Compact per-face metadata replaces the
 // position / UV / vertex-index streams used by surface-v3.
 //
-// Fast path on subgroup-capable backends: the four transformed carrier corners
-// are used as an affine basis and each rectangle corner is collapsed onto the
-// real source triangle/quad vertex. This restores exact raster geometry (no
-// bounding-rectangle overdraw or fragment discard) on NVIDIA/Vulkan/supporting
-// OpenGL, while macOS OpenGL keeps the subgroup-free clipped-rectangle path.
+// Subgroup-capable backends use an exact-geometry fast path: each invocation
+// fetches only its own local point + UV, then reconstructs that point from the
+// already-transformed carrier corners. The padded fourth corner of a triangle
+// collapses onto corner 2, so no bounding rectangle is rasterized. Apple OpenGL
+// keeps the subgroup-free clipped-rectangle fallback.
 bool ocStaticHandled = false;
 isCustom = 0;
 transition = 0.0;
@@ -93,13 +93,39 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
     } else {
         int ocLocalLinear = (ocPixel.y - ocTopLeft.y) * ocSize.x
                           + (ocPixel.x - ocTopLeft.x);
+        vec2 ocUvSelf = vec2(0.0);
+        float ocFaceVmid = 0.0;
+
+#ifdef GL_KHR_shader_subgroup_quad
+        // Metadata layout relative to this face's pointer texel:
+        // +1 flags, +2..+5 local q0..q3, +6..+9 uv0..uv3.
+        // The exact path only needs this lane's q/uv: 2 metadata fetches instead
+        // of the fallback's 9. Face-wide V midpoint comes from the four lanes.
+        int ocQL = ocLocalLinear + 2 + ocCorner;
+        int ocUL = ocLocalLinear + 6 + ocCorner;
+        ivec2 ocQCoord = ocTopLeft + ivec2(ocQL % ocSize.x, ocQL / ocSize.x);
+        ivec2 ocUCoord = ocTopLeft + ivec2(ocUL % ocSize.x, ocUL / ocSize.x);
+        ivec4 ocQM = ivec4(texelFetch(Sampler0, ocQCoord, 0) * 255.0 + 0.5);
+        ivec4 ocUM = ivec4(texelFetch(Sampler0, ocUCoord, 0) * 255.0 + 0.5);
+        vec2 ocQSelf = vec2(ocQM.r * 256 + ocQM.g, ocQM.b * 256 + ocQM.a) / 65535.0;
+        ocUvSelf = vec2(ocUM.r * 256 + ocUM.g, ocUM.b * 256 + ocUM.a) / 65535.0;
+
+        // Corner roles for the generated NORTH rectangle:
+        // lane 2=(0,0), lane 1=(1,0), lane 3=(0,1).
+        vec3 ocCarrierOrigin = subgroupQuadBroadcast(Pos, 2);
+        vec3 ocCarrierX = subgroupQuadBroadcast(Pos, 1) - ocCarrierOrigin;
+        vec3 ocCarrierY = subgroupQuadBroadcast(Pos, 3) - ocCarrierOrigin;
+        Pos = ocCarrierOrigin + ocCarrierX * ocQSelf.x + ocCarrierY * ocQSelf.y;
+        ocFaceVmid = (subgroupQuadBroadcast(ocUvSelf.y, 0)
+                    + subgroupQuadBroadcast(ocUvSelf.y, 2)) * 0.5 * float(ocSize.y);
+#else
+        // Apple OpenGL 4.1 fallback needs all points/UVs for fragment clipping.
         ivec4 ocM[9];
         for (int ocI = 0; ocI < 9; ocI++) {
             int ocL = ocLocalLinear + 1 + ocI;
             ivec2 ocMetaCoord = ocTopLeft + ivec2(ocL % ocSize.x, ocL / ocSize.x);
             ocM[ocI] = ivec4(texelFetch(Sampler0, ocMetaCoord, 0) * 255.0 + 0.5);
         }
-
         int ocPackedFlags = ocM[0].r;
         int ocVertexCount = clamp(ocM[0].g, 3, 4);
         vec2 ocQ0 = vec2(ocM[1].r * 256 + ocM[1].g, ocM[1].b * 256 + ocM[1].a) / 65535.0;
@@ -110,31 +136,11 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
         vec2 ocUv1 = vec2(ocM[6].r * 256 + ocM[6].g, ocM[6].b * 256 + ocM[6].a) / 65535.0;
         vec2 ocUv2 = vec2(ocM[7].r * 256 + ocM[7].g, ocM[7].b * 256 + ocM[7].a) / 65535.0;
         vec2 ocUv3 = vec2(ocM[8].r * 256 + ocM[8].g, ocM[8].b * 256 + ocM[8].a) / 65535.0;
-
-        vec2 ocQSelf = (ocCorner == 0) ? ocQ0
-                     : (ocCorner == 1) ? ocQ1
-                     : (ocCorner == 2) ? ocQ2
-                                       : ocQ3;
-        vec2 ocUvSelf = (ocCorner == 0) ? ocUv0
-                      : (ocCorner == 1) ? ocUv1
-                      : (ocCorner == 2) ? ocUv2
-                                        : ocUv3;
-
-#ifdef GL_KHR_shader_subgroup_quad
-        // Corner roles for the generated NORTH rectangle are:
-        //   lane 2 = local (0,0), lane 1 = (1,0), lane 3 = (0,1).
-        // Minecraft has already applied the complete display/entity transform to
-        // those positions. Affine reconstruction therefore preserves scale.z,
-        // both rotations, shear and reflections while emitting the exact source
-        // triangle/quad. A padded triangle has q3==q2, so its second raster
-        // triangle becomes degenerate instead of shading the bounding rectangle.
-        vec3 ocCarrierOrigin = subgroupQuadBroadcast(Pos, 2);
-        vec3 ocCarrierX = subgroupQuadBroadcast(Pos, 1) - ocCarrierOrigin;
-        vec3 ocCarrierY = subgroupQuadBroadcast(Pos, 3) - ocCarrierOrigin;
-        Pos = ocCarrierOrigin + ocCarrierX * ocQSelf.x + ocCarrierY * ocQSelf.y;
-#else
-        // Apple OpenGL 4.1 fallback: keep the real-face bounding rectangle and
-        // clip it to the source polygon in the fragment shader.
+        ocUvSelf = (ocCorner == 0) ? ocUv0
+                 : (ocCorner == 1) ? ocUv1
+                 : (ocCorner == 2) ? ocUv2
+                                   : ocUv3;
+        ocFaceVmid = (ocUv0.y + ocUv2.y) * 0.5 * float(ocSize.y);
         ocSurfaceCoord = (ocCorner == 0) ? vec2(1.0, 1.0)
                        : (ocCorner == 1) ? vec2(1.0, 0.0)
                        : (ocCorner == 2) ? vec2(0.0, 0.0)
@@ -174,7 +180,6 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
             ocBase1.y += float(ocFrame1 * ocSize.y);
             transition = ocTexFade ? fract(ocTexTime / ocTexFrameTime) : 0.0;
         } else if (ocBandCount > 0) {
-            float ocVmid = (ocUv0.y + ocUv2.y) * 0.5 * float(ocSize.y);
             for (int ocB = 0; ocB < 15; ocB++) {
                 if (ocB >= ocBandCount) break;
                 ivec4 ocB0 = ivec4(texelFetch(Sampler0, ocTopLeft + ivec2(6 + 2 * ocB, 1), 0) * 255.0 + 0.5);
@@ -182,7 +187,7 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
                 int ocY0 = ocB0.r * 256 + ocB0.g;
                 int ocFrameH = ocB0.b * 256 + ocB1.r;
                 int ocFrameCount = max(ocB1.g, 1);
-                if (ocVmid > float(ocY0) && ocVmid < float(ocY0 + ocFrameH)) {
+                if (ocFaceVmid > float(ocY0) && ocFaceVmid < float(ocY0 + ocFrameH)) {
                     int ocF0 = int(ocTexTime / ocTexFrameTime) % ocFrameCount;
                     int ocF1 = (ocF0 + 1) % ocFrameCount;
                     ocBase0.y -= float(ocF0 * ocFrameH);
@@ -193,10 +198,8 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
             }
         }
 #ifdef GL_KHR_shader_subgroup_quad
-        // Exact-geometry path: UV is affine on the source face, so assigning the
-        // decoded source UV at each real vertex lets fixed-function interpolation
-        // do all per-fragment work. ocSurfaceMap stays zero and the fragment shader
-        // takes its normal one-sample path with no barycentric math or discard.
+        // Exact geometry + per-vertex UV: fixed-function interpolation handles
+        // the fragment, so the fragment shader takes its one-sample/no-discard path.
         texCoord = (ocBase0 + ocUvSelf * vec2(ocSize)) / vec2(ocAtlasSize);
         texCoord2 = (ocBase1 + ocUvSelf * vec2(ocSize)) / vec2(ocAtlasSize);
 #else
