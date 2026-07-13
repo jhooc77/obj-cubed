@@ -1,0 +1,18 @@
+{
+  "patch": "OC_SURFACE_V4_ONLY_v1_5",
+  "upstream": "JagerMeistars/obj-cubed",
+  "upstream_ref_tested": "6a85a1f30f5dd0843c656838c5ebca13f0e029ed",
+  "backend": "surface-v4-only-static",
+  "shader_version": 410,
+  "subgroup": false,
+  "fallback": false,
+  "native_rectangle_fast_path": true,
+  "provoking_vertex_metadata_fetch": true,
+  "non_planar_quad_policy": "automatic triangulation",
+  "unsupported": [
+    "geometry animation",
+    "worn equipment/armor",
+    "RGB geometry scale",
+    "RGB geometry-time control"
+  ]
+}

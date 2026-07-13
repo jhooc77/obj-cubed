@@ -105,12 +105,10 @@ function analyze(res) {
   const sizeY = t1[2] * 256 + t7[0];
   // objmc_main.glsl:33 nvertices = t[2].rgb<<.. + t[7].g
   const nvertices = t2[0] * 16777216 + t2[1] * 65536 + t2[2] * 256 + t7[1];
-  // objmc_main.glsl:42-43 vph/vth
+  // Surface-v4-only: t[5].rg stores compact metadata height.
   const vph = t5[0] * 256 + t5[1];
-  const vth = t5[2] * 256 + t7[2];
-  // objmc_main.glsl:140 headerheight = 2 + ceil(nvertices*0.25/size.x)
-  const headerheight = 2 + Math.ceil(nvertices * 0.25 / sizeX);
-  // objmc_main.glsl:141 height = headerheight + size.y*ntextures (ntextures=1)
+  const vth = 0;
+  const headerheight = 2 + vph;
   const posBase = headerheight + sizeY;
   // Locate the first row whose blue marker (200) appears -> real texture block start.
   let firstTexRow = -1, lastTexRow = -1;

@@ -10,17 +10,31 @@ Forked from [Godlander's objmc](https://github.com/Godlander/objmc) — the orig
 
 Model geometry (vertex positions, UVs, face indices) is encoded into a specially formatted PNG texture. A set of core shaders included in the resource pack reads this texture at render time, reconstructing the 3D mesh from the pixel data. The vanilla Minecraft renderer displays the result — no mods required.
 
+## Surface-v4-only performance branch
+
+This branch intentionally ships one subgroup-free static backend. Static OBJ
+items, item displays, blocks, display transforms (including independent Z scale
+and both rotations), textures/atlases, texture animation, tinting, and emissive
+faces remain available. Non-planar/concave/non-affine quads and N-gons are
+triangulated automatically during export.
+
+Geometry animation, worn equipment/armor, RGB geometry scale, and RGB geometry-
+time control are rejected with a clear export error; there is no legacy/full-v2
+fallback. The runtime shaders are GLSL 4.10 and contain no subgroup extension or
+`subgroupQuadBroadcast` call.
+
+The renderer uses three static fast paths: exact rectangular faces can bypass
+the custom decoder entirely, other rectangles skip fragment clipping, and
+remaining triangles/convex quads use precomputed affine UV and edge equations.
+Only the two possible provoking vertices fetch per-face metadata.
+
 ## Features
 
 - **Direct BlockBench export** — File > Export as obj^3
-- **Armor / equipment export** — render a model as worn armor; one piece can span several body parts (a chestplate = torso + both arms), each following its own bone on the player/armor stand
 - **Body-part tagging** — right-click a group to assign it a body part; tags persist in the `.bbmodel`
 - **Emissive faces** — right-click a cube/mesh to make it fullbright
-- **Keyframe animation baking** — BB animations are baked frame-by-frame into the encoded texture
 - **Animated textures** — a frame-strip texture plays in game (hand, GUI, world, armor), with per-frame tick rate and optional cross-fade; works standalone or inside an atlas
-- **Armature & bone skinning** — weighted vertex skinning from BB Generic Model rigs
 - **Multi-texture atlas** — combine multiple textures into one atlas automatically (one animated strip per atlas keeps animating)
-- **Datapack generation** — animation control functions (play, stop, play_once, etc.) with GameTime sync
 - **Vanilla-exact display** — every display slot (right/left hand in first and third person, head, GUI, ground, item frame, shelf) has its own tab with rotation/translation/scale, and a model lands exactly where the same vanilla model would — rotations included
 - **Presets** — multiple named export configurations saved per project
 - **Localized UI** — English and Russian, with an in-dialog guided tour of every control
@@ -31,7 +45,6 @@ Model geometry (vertex positions, UVs, face indices) is encoded into a specially
 - BlockBench 4.8.0+ (desktop variant — the custom PNG encoder needs Node.js)
 - Minecraft 26.1.2 – 26.2 — the bundled core shaders support both (26.2's reversed
   depth buffer and relocated entity geometry are detected and handled in-shader)
-- Armor export additionally needs the entity equipment pipeline (included in the pack)
 
 Core shaders are a vanilla resource-pack feature, but they are version-sensitive: the
 shaders are tuned for 26.1.2–26.2 and may need updating for other versions. Modded

@@ -172,7 +172,7 @@ describe('tex-anim #9: header + per-region frame baking', () => {
     // r bits 1..4 = dynamic slot-marker count (ground+shelf are always dynamic
     // -> 2 -> r=4), b = the v2 version flag.
     expect(h.rd(4, 1)).toEqual([0, 0, 0, 255]);
-    expect(h.rd(5, 1)).toEqual([4, 0, 1, 255]);
+    expect(h.rd(5, 1)).toEqual([0, 0, 1, 255]);
 
     // Independently rebuild the EXACT pre-#9 buffer from the same decoded header
     // and source strip, then compare byte-for-byte against the produced buffer.
@@ -188,7 +188,8 @@ describe('tex-anim #9: header + per-region frame baking', () => {
     // Texture block: legacy single global flip — dest row py <- src row (H-1-py).
     const strip = makeStrip(W, H).data;
     const headerRows = 2;
-    const uvH = Math.ceil(res.nfaces / tw);
+    const t5 = h.rd(5, 0);
+    const uvH = t5[0] * 256 + t5[1];
     for (let py = 0; py < H; py++) {
       const srcY = H - 1 - py; // flipuv=false
       for (let px = 0; px < tw; px++) {

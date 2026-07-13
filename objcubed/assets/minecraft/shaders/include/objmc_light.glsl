@@ -20,6 +20,9 @@ if (isCustom == 0) {
 }
 //custom lighting
 else if (noshadow == 0) {
+#ifdef ENTITY
+    vec4 ocLightingOverlay = (isCustom == 1) ? ocSurfaceOverlay : overlayColor;
+#endif
     //normal from position derivatives
     vec3 normal = normalize(cross(dFdx(Pos), dFdy(Pos)));
 
@@ -36,11 +39,11 @@ else if (noshadow == 0) {
     //flip normal z for gui (zx flip in vertex shader)
     if (isGUI == 1) normal.z *= -1;
 #if defined(PER_FACE_LIGHTING) || !defined(NO_CARDINAL_LIGHTING)
-    color *= minecraft_mix_light(Light0_Direction, Light1_Direction, normal, overlayColor);
+    color *= minecraft_mix_light(Light0_Direction, Light1_Direction, normal, ocLightingOverlay);
 #else
     // NO_CARDINAL_LIGHTING pipelines have no Lighting UBO: skip the
     // directional relight, keep the overlay tint.
-    color *= overlayColor;
+    color *= ocLightingOverlay;
 #endif
 #endif
 

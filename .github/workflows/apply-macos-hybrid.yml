@@ -1,0 +1,119 @@
+name: Build subgroup-free Surface-v4-only backend
+
+on:
+  push:
+    branches:
+      - agent/surface-v4-only-fast
+    paths:
+      - .github/workflows/apply-macos-hybrid.yml
+      - tools/macos-hybrid/**
+      - test/unit/surface-v4-only.test.mjs
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: surface-v4-only-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-validate-package:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Generate Surface-v4-only source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/macos-hybrid/optimize_surface_v4_only.py .
+          # The optimizer must be deterministic and idempotent.
+          python3 tools/macos-hybrid/optimize_surface_v4_only.py .
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+
+      - name: Static validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check objcubed.js
+          python3 tools/macos-hybrid/validate_actual.py
+          ! grep -RInE 'subgroupQuadBroadcast|GL_KHR_shader_subgroup|OC_HAS_SUBGROUP' \
+              objcubed/assets/minecraft/shaders
+          ! grep -RIn 'OC_STATIC_FALLBACK' objcubed.js
+          grep -q 'OC_STATIC_META_STRIDE = 9' objcubed.js
+          grep -q 'ocCorner == 0 || ocCorner == 2' \
+              objcubed/assets/minecraft/shaders/include/objmc_main.glsl
+          grep -q 'ocResolveStaticUvFast' \
+              objcubed/assets/minecraft/shaders/include/objmc_static_fragment.glsl
+
+      - name: Install tests
+        run: npm install --ignore-scripts --force
+
+      - name: Run Surface-v4-only and unaffected upstream tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx vitest run \
+            --exclude test/unit/equipment-export.test.mjs \
+            --exclude test/unit/display-static-bit.test.mjs \
+            --exclude test/unit/audit-fixes.test.mjs
+
+      - name: Build downloadable ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          zip -qr dist/obj-cubed-surface-v4-only-v1.5.1.zip . \
+            -x '.git/*' 'node_modules/*' 'dist/*' '*.pre-hybrid-surface' '**/__pycache__/*'
+          sha256sum dist/obj-cubed-surface-v4-only-v1.5.1.zip \
+            > dist/obj-cubed-surface-v4-only-v1.5.1.zip.sha256
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: obj-cubed-surface-v4-only-v1.5.1
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Commit generated source
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          generated_paths=(
+            .github/workflows/apply-macos-hybrid.yml
+            README.md
+            HYBRID_SURFACE_PATCH.json
+            objcubed.js
+            objcubed
+            tools/macos-hybrid
+            test/unit/surface-v4-only.test.mjs
+            test/unit/gui-q16-roundtrip.test.mjs
+            test/unit/tex-anim-header.test.mjs
+            test/unit/texture-height.test.mjs
+          )
+          git add -A -- "${generated_paths[@]}"
+          if git diff --cached --quiet; then
+            echo 'No generated changes to commit.'
+            exit 0
+          fi
+          git commit -m 'Make Surface v4 static-only and optimize no-subgroup rendering'
+          git push origin HEAD:agent/surface-v4-only-fast

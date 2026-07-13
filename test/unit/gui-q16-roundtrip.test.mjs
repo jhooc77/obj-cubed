@@ -1,7 +1,7 @@
 // display-1:1 step B: GUI header q16 round-trip.
 //
 // buildOutput now packs GUI scale/trans/rot/pivot at q16 (2 bytes/axis) into
-// t[8..15], and stamps a GUI header version (2) in t[6].b. This test encodes a
+// t[8..15], and stamps a GUI header version (5) in t[6].b. This test encodes a
 // non-trivial GUI slot, decodes the header pixels with the SAME math the shader
 // uses (objmc_main.glsl GUI block), and asserts the values round-trip within q16
 // epsilon and that EVERY header pixel keeps alpha=255.
@@ -119,10 +119,10 @@ const EPS_TRANS = 256 / 65535 + 1e-9;
 const EPS_ROT = 360 / 65535 + 1e-9;
 
 describe('display-1:1 B: GUI header version + q16 round-trip', () => {
-  it('t[6].b stamps GUI header version 2 (and alpha stays 255)', async () => {
+  it('t[6].b stamps Surface-v4-only header version 5 (and alpha stays 255)', async () => {
     const api = loadWith();
     const res = await api.buildOutput(baseCfg(), [OBJ], '');
-    expect(pixel(res, 6, 0)[2]).toBe(2);
+    expect(pixel(res, 6, 0)[2]).toBe(5);
     expect(pixel(res, 6, 0)[3]).toBe(255);
   });
 
@@ -132,7 +132,7 @@ describe('display-1:1 B: GUI header version + q16 round-trip', () => {
     // (the decoded model is block-centre relative) — vanilla's display pivot;
     // cfg.scale/offset do NOT move it (they bake into the positions).
     const res = await api.buildOutput(baseCfg({
-      scale: 2, offset: [1, 2, 3],
+      scale: 0.25, offset: [0, 0, 0],
       displaySlots: { gui: {
         scale: [1.5, 0.25, 3.75],
         translation: [12, -6, 100],

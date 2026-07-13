@@ -1,6 +1,4 @@
-#version 450
-#extension GL_KHR_shader_subgroup_quad: enable
-
+#version 410
 #moj_import <minecraft:light.glsl>
 #moj_import <minecraft:fog.glsl>
 #moj_import <minecraft:dynamictransforms.glsl>
@@ -27,7 +25,15 @@ out vec4 overlayColor;
 out vec2 texCoord;
 out vec2 texCoord2;
 out vec3 Pos;
-out float transition;
+flat out float transition;
+
+out vec2 ocSurfaceCoord;
+flat out vec4 ocSurfaceP01;
+flat out vec4 ocSurfaceP23;
+flat out vec4 ocSurfaceUV01;
+flat out vec4 ocSurfaceUV23;
+flat out vec4 ocSurfaceMap;
+flat out vec4 ocSurfaceOverlay;
 
 flat out int isCustom;
 flat out int isGUI;
@@ -36,7 +42,15 @@ flat out int noshadow;
 
 #moj_import <objmc_tools.glsl>
 
+// OC_SURFACE_V4_ONLY_v1_5
 void main() {
+    ocSurfaceCoord = vec2(0.0);
+    ocSurfaceP01 = vec4(0.0);
+    ocSurfaceP23 = vec4(0.0);
+    ocSurfaceUV01 = vec4(0.0);
+    ocSurfaceUV23 = vec4(0.0);
+    ocSurfaceMap = vec4(0.0);
+    ocSurfaceOverlay = vec4(1.0);
     Pos = Position;
     texCoord = UV0;
     overlayColor = vec4(1);

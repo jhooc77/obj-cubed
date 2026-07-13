@@ -1968,78 +1968,349 @@
     // =========================================================
     // Section 5: Vertex Indexing
     // =========================================================
-    function buildVertexData(objContents, atlasInfo, partRef, faceToPart) {
-        // atlasInfo: null (single texture) or { materialToTexIdx, offsets, width, height }
-        // partRef/faceToPart: per-part re-centering (armor only); null = no centering.
+    function buildVertexData(objContents, atlasInfo) {
+        if (!objContents || objContents.length !== 1)
+            throw new Error('Surface-v4-only export requires exactly one static OBJ frame.');
         const count = [0, 0];
         const mem   = { pos: Object.create(null), uv: Object.create(null) };
         const data  = { positions: [], uvs: [], vertices: [] };
-
         let uvClamped = false;
+
         function remapUV(uv, material) {
             if (!atlasInfo) return uv;
             const texIdx = atlasInfo.materialToTexIdx.get(material);
             const off = texIdx !== undefined ? atlasInfo.offsets.get(texIdx) : null;
             if (!off) return uv;
-            // Clamp BEFORE remapping: an out-of-range (tiling/negative) UV scaled
-            // into the atlas lands inside a NEIGHBORING texture's region while
-            // still passing the post-remap [0,1] checks — silently sampling the
-            // wrong texture. Clamp per-texture and flag it so buildOutput warns
-            // (same behavior the single-texture path gets via uvPixels).
             const u = Math.max(0, Math.min(1, uv[0]));
             const v = Math.max(0, Math.min(1, uv[1]));
             if (Math.abs(u - uv[0]) > 1e-6 || Math.abs(v - uv[1]) > 1e-6) uvClamped = true;
-            // V remap, uv_height-aware. BB uv space covers the FIRST (top) frame
-            // for BB-animated textures (uvh = frame height) and the whole image
-            // otherwise (uvh = h, reduces to the classic v*h + off.y). The atlas
-            // stores each region V-FLIPPED, so the image-top uv area lands at the
-            // BOTTOM of the region: off.y + off.h - uvh + v*uvh. This is exactly
-            // the frame-0 band the shader cycles from.
             const uvh = off.uvh || off.h;
             return [
                 u * off.w / atlasInfo.width,
                 (v * uvh + off.y + off.h - uvh) / atlasInfo.height
             ];
         }
-
-        function indexVert(o, vert, material, part) {
-            let pos = o.positions[vert[0]] || [0,0,0];
-            if (partRef) { const r = partRef.get(part); if (r) pos = [pos[0]-r[0], pos[1]-r[1], pos[2]-r[2]]; }
-            const rawUv = o.uvs[vert[1]]    || [0,0];
+        function indexVert(o, vert, material) {
+            const pos = o.positions[vert[0]] || [0,0,0];
+            const rawUv = o.uvs[vert[1]] || [0,0];
             const uv = remapUV(rawUv, material);
-            const pk  = pos.join(',');
-            const uk  = uv[0].toFixed(8) + ',' + uv[1].toFixed(8);
-            let pi = mem.pos[pk];
-            if (pi === undefined) { pi = count[0]++; mem.pos[pk] = pi; data.positions.push(pos); }
-            let ui = mem.uv[uk];
-            if (ui === undefined) { ui = count[1]++; mem.uv[uk] = ui; data.uvs.push(uv); }
-            data.vertices.push([pi, ui]);
+            const pk = pos.join(',');
+            const uk = uv[0].toFixed(8)+','+uv[1].toFixed(8);
+            let pi=mem.pos[pk];
+            if (pi===undefined) { pi=count[0]++;mem.pos[pk]=pi;data.positions.push(pos); }
+            let ui=mem.uv[uk];
+            if (ui===undefined) { ui=count[1]++;mem.uv[uk]=ui;data.uvs.push(uv); }
+            data.vertices.push([pi,ui]);
         }
-
-        function indexObj(o) {
-            for (let fi = 0; fi < o.faces.length; fi++) {
-                const face = o.faces[fi];
-                const mtl = o.faceMaterials[fi];
-                const part = faceToPart ? faceToPart[fi] : -1;
-                const n = Math.min(4, face.length);
-                for (let i = 0; i < n; i++) indexVert(o, face[i], mtl, part);
-                // Pad a triangle to a quad by repeating the LAST vertex (v0,v1,v2,v2):
-                // the 2nd sub-triangle (v0,v2,v2) is then zero-area/degenerate. Repeating
-                // the MIDDLE vertex instead gave (v0,v2,v1) — a reverse-wound coincident
-                // face that flickers / z-fights.
-                if (face.length === 3) indexVert(o, face[2], mtl, part);
-                if (face.length > 4) console.warn('[obj3] N-Gon — only first 4 verts used');
-            }
+        const firstObj = normalizeStaticObj(parseObj(objContents[0],0));
+        for (let fi=0;fi<firstObj.faces.length;fi++) {
+            const face=firstObj.faces[fi],mtl=firstObj.faceMaterials[fi];
+            for (const vert of face) indexVert(firstObj,vert,mtl);
+            if (face.length===3) indexVert(firstObj,face[2],mtl);
         }
-
-        const firstObj = parseObj(objContents[0], 0);
-        const nfaces   = firstObj.faces.length;
-        indexObj(firstObj);
-        for (let f = 1; f < objContents.length; f++)
-            indexObj(parseObj(objContents[f], nfaces));
-
-        return { data, nfaces, faceGroups: firstObj.faceGroups, faceBlocks: firstObj.faceBlocks, uvClamped };
+        return {
+            data,
+            firstObj,
+            nfaces:firstObj.faces.length,
+            faceGroups:firstObj.faceGroups,
+            faceBlocks:firstObj.faceBlocks,
+            uvClamped,
+            normalizationStats:firstObj.normalizationStats,
+        };
     }
+
+// OC_SURFACE_V4_ONLY_v1_5
+// Static-only, subgroup-free exporter. OBJ polygons are normalized before
+// indexing: N-gons, concave quads, non-planar quads and non-affine UV quads
+// are triangulated. Planar convex affine quads stay as one carrier.
+const OC_STATIC_META_STRIDE = 9;
+const OC_STATIC_PLANAR_EPS = 2e-4;
+const OC_STATIC_EPS = 1e-8;
+
+function oc3vSub(a,b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+function oc3vAdd(a,b) { return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]; }
+function oc3vMul(a,s) { return [a[0]*s, a[1]*s, a[2]*s]; }
+function oc3vDot(a,b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+function oc3vCross(a,b) {
+    return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+}
+function oc3vLen(a) { return Math.hypot(a[0],a[1],a[2]); }
+function oc3vNorm(a) { const l=oc3vLen(a); return l>OC_STATIC_EPS ? oc3vMul(a,1/l) : null; }
+function oc2Cross(a,b) { return a[0]*b[1]-a[1]*b[0]; }
+function oc2Area(poly) {
+    let a=0;
+    for (let i=0;i<poly.length;i++) {
+        const p=poly[i], q=poly[(i+1)%poly.length];
+        a += p[0]*q[1]-p[1]*q[0];
+    }
+    return a*0.5;
+}
+function ocPointInTri2(p,a,b,c,sign) {
+    const e0=sign*oc2Cross([b[0]-a[0],b[1]-a[1]],[p[0]-a[0],p[1]-a[1]]);
+    const e1=sign*oc2Cross([c[0]-b[0],c[1]-b[1]],[p[0]-b[0],p[1]-b[1]]);
+    const e2=sign*oc2Cross([a[0]-c[0],a[1]-c[1]],[p[0]-c[0],p[1]-c[1]]);
+    return e0>=-1e-10 && e1>=-1e-10 && e2>=-1e-10;
+}
+function ocProjectPolygon(points) {
+    let n=[0,0,0];
+    for (let i=0;i<points.length;i++) {
+        const p=points[i], q=points[(i+1)%points.length];
+        n[0] += (p[1]-q[1])*(p[2]+q[2]);
+        n[1] += (p[2]-q[2])*(p[0]+q[0]);
+        n[2] += (p[0]-q[0])*(p[1]+q[1]);
+    }
+    let N=oc3vNorm(n);
+    if (!N) {
+        for (let i=1;i+1<points.length && !N;i++)
+            N=oc3vNorm(oc3vCross(oc3vSub(points[i],points[0]),oc3vSub(points[i+1],points[0])));
+    }
+    if (!N) return null;
+    const ax=Math.abs(N[0]), ay=Math.abs(N[1]), az=Math.abs(N[2]);
+    const drop = ax>=ay && ax>=az ? 0 : (ay>=az ? 1 : 2);
+    const q=points.map(p => drop===0 ? [p[1],p[2]] : drop===1 ? [p[0],p[2]] : [p[0],p[1]]);
+    return { q, N };
+}
+function ocTriangulateFace(face, positions, label) {
+    const refs=[];
+    for (const r of face) {
+        if (!refs.length || r[0]!==refs[refs.length-1][0] || r[1]!==refs[refs.length-1][1]) refs.push(r);
+    }
+    if (refs.length>2 && refs[0][0]===refs[refs.length-1][0] && refs[0][1]===refs[refs.length-1][1]) refs.pop();
+    if (refs.length<3) return [];
+    const points=refs.map(r=>positions[r[0]] || [0,0,0]);
+    const proj=ocProjectPolygon(points);
+    if (!proj || Math.abs(oc2Area(proj.q))<OC_STATIC_EPS) {
+        console.warn(`[obj³] dropped zero-area face ${label}`);
+        return [];
+    }
+    const sign=oc2Area(proj.q)>=0 ? 1 : -1;
+    const indices=refs.map((_,i)=>i);
+    const tris=[];
+    let guard=0;
+    while (indices.length>3 && guard++<refs.length*refs.length) {
+        let cut=false;
+        for (let j=0;j<indices.length;j++) {
+            const ia=indices[(j+indices.length-1)%indices.length];
+            const ib=indices[j];
+            const ic=indices[(j+1)%indices.length];
+            const a=proj.q[ia], b=proj.q[ib], c=proj.q[ic];
+            if (sign*oc2Cross([b[0]-a[0],b[1]-a[1]],[c[0]-b[0],c[1]-b[1]])<=1e-10) continue;
+            let contains=false;
+            for (const ip of indices) {
+                if (ip===ia||ip===ib||ip===ic) continue;
+                if (ocPointInTri2(proj.q[ip],a,b,c,sign)) { contains=true; break; }
+            }
+            if (contains) continue;
+            tris.push([refs[ia],refs[ib],refs[ic]]);
+            indices.splice(j,1);
+            cut=true;
+            break;
+        }
+        if (!cut) throw new Error(`Cannot triangulate self-intersecting/degenerate OBJ face ${label}`);
+    }
+    if (indices.length===3) tris.push(indices.map(i=>refs[i]));
+    return tris;
+}
+function ocQuadIsPlanarAffine(face,o) {
+    if (face.length!==4) return false;
+    const p=face.map(r=>o.positions[r[0]] || [0,0,0]);
+    let n=oc3vNorm(oc3vCross(oc3vSub(p[1],p[0]),oc3vSub(p[2],p[0])));
+    if (!n) return false;
+    const scale=Math.max(1,oc3vLen(oc3vSub(p[1],p[0])),oc3vLen(oc3vSub(p[2],p[0])),oc3vLen(oc3vSub(p[3],p[0])));
+    if (Math.abs(oc3vDot(oc3vSub(p[3],p[0]),n))>Math.max(OC_STATIC_PLANAR_EPS,scale*OC_STATIC_PLANAR_EPS)) return false;
+    const U=oc3vNorm(oc3vSub(p[1],p[0]));
+    const V=U && oc3vNorm(oc3vCross(U,n));
+    if (!U||!V) return false;
+    const q=p.map(P=>{const d=oc3vSub(P,p[0]);return [oc3vDot(d,U),oc3vDot(d,V)];});
+    const area=oc2Area(q);
+    if (Math.abs(area)<OC_STATIC_EPS) return false;
+    const sign=area>=0?1:-1;
+    for (let i=0;i<4;i++) {
+        const a=q[i],b=q[(i+1)%4],c=q[(i+2)%4];
+        if (sign*oc2Cross([b[0]-a[0],b[1]-a[1]],[c[0]-b[0],c[1]-b[1]])<-1e-9) return false;
+    }
+    const d1=[q[1][0]-q[0][0],q[1][1]-q[0][1]];
+    const d2=[q[2][0]-q[0][0],q[2][1]-q[0][1]];
+    const det=oc2Cross(d1,d2);
+    if (Math.abs(det)<OC_STATIC_EPS) return false;
+    const d3=[q[3][0]-q[0][0],q[3][1]-q[0][1]];
+    const b1=oc2Cross(d3,d2)/det;
+    const b2=oc2Cross(d1,d3)/det;
+    const uv=face.map(r=>o.uvs[r[1]] || [0,0]);
+    const pred=[uv[0][0]+b1*(uv[1][0]-uv[0][0])+b2*(uv[2][0]-uv[0][0]),
+                uv[0][1]+b1*(uv[1][1]-uv[0][1])+b2*(uv[2][1]-uv[0][1])];
+    return Math.hypot(pred[0]-uv[3][0],pred[1]-uv[3][1])<=2e-5;
+}
+function normalizeStaticObj(o) {
+    const out={positions:o.positions,uvs:o.uvs,faces:[],faceMaterials:[],faceGroups:[],faceBlocks:[]};
+    let split=0,dropped=0;
+    const push=(f,fi)=>{
+        out.faces.push(f);
+        out.faceMaterials.push(o.faceMaterials[fi]);
+        out.faceGroups.push(o.faceGroups[fi]);
+        out.faceBlocks.push(o.faceBlocks[fi]);
+    };
+    for (let fi=0;fi<o.faces.length;fi++) {
+        const f=o.faces[fi];
+        if (f.length===3) { push(f,fi); continue; }
+        if (f.length===4 && ocQuadIsPlanarAffine(f,o)) { push(f,fi); continue; }
+        // Preserve Minecraft's canonical quad diagonal (0,1,2) + (2,3,0).
+        // This matters for non-planar quads and UVs that are not affine across
+        // the whole quad: choosing the other diagonal changes the surface.
+        if (f.length===4) {
+            push([f[0],f[1],f[2]],fi);
+            push([f[0],f[2],f[3]],fi);
+            split++;
+            continue;
+        }
+        const tris=ocTriangulateFace(f,o.positions,`${fi}${o.faceGroups[fi]?` (${o.faceGroups[fi]})`:''}`);
+        if (!tris.length) { dropped++; continue; }
+        for (const t of tris) push(t,fi);
+        split += Math.max(0,tris.length-1);
+    }
+    out.normalizationStats={sourceFaces:o.faces.length,outputFaces:out.faces.length,splitExtra:split,dropped};
+    return out;
+}
+
+function ocCarrierCandidates(points) {
+    let N=null;
+    for (let i=1;i+1<points.length&&!N;i++)
+        N=oc3vNorm(oc3vCross(oc3vSub(points[i],points[0]),oc3vSub(points[i+1],points[0])));
+    if (!N) return [];
+    const out=[];
+    for (let i=0;i<points.length;i++) {
+        const U=oc3vNorm(oc3vSub(points[(i+1)%points.length],points[i])); if (!U) continue;
+        const V=oc3vNorm(oc3vCross(U,N)); if (!V) continue;
+        const q=points.map(P=>{const d=oc3vSub(P,points[0]);return [oc3vDot(d,U),oc3vDot(d,V)];});
+        const mn=[Math.min(...q.map(x=>x[0])),Math.min(...q.map(x=>x[1]))];
+        const mx=[Math.max(...q.map(x=>x[0])),Math.max(...q.map(x=>x[1]))];
+        const w=mx[0]-mn[0],h=mx[1]-mn[1],area=w*h;
+        if (!(w>OC_STATIC_EPS&&h>OC_STATIC_EPS)) continue;
+        out.push({U,V,N,q,mn,mx,w,h,area});
+    }
+    return out;
+}
+function ocUvAffine(q,uv) {
+    const d1=[q[1][0]-q[0][0],q[1][1]-q[0][1]];
+    const d2=[q[2][0]-q[0][0],q[2][1]-q[0][1]];
+    const det=oc2Cross(d1,d2);
+    if (Math.abs(det)<OC_STATIC_EPS) return null;
+    const b1x=d2[1]/det,b1y=-d2[0]/det,b1c=-(b1x*q[0][0]+b1y*q[0][1]);
+    const b2x=-d1[1]/det,b2y=d1[0]/det,b2c=-(b2x*q[0][0]+b2y*q[0][1]);
+    const du1=[uv[1][0]-uv[0][0],uv[1][1]-uv[0][1]];
+    const du2=[uv[2][0]-uv[0][0],uv[2][1]-uv[0][1]];
+    return {
+        u:[du1[0]*b1x+du2[0]*b2x,du1[0]*b1y+du2[0]*b2y,uv[0][0]+du1[0]*b1c+du2[0]*b2c],
+        v:[du1[1]*b1x+du2[1]*b2x,du1[1]*b1y+du2[1]*b2y,uv[0][1]+du1[1]*b1c+du2[1]*b2c],
+    };
+}
+function ocIsCarrierRectangle(q,count) {
+    if (count!==4) return false;
+    const seen=new Set();
+    for (const p of q) {
+        const x=Math.abs(p[0])<2e-5?0:Math.abs(p[0]-1)<2e-5?1:-1;
+        const y=Math.abs(p[1])<2e-5?0:Math.abs(p[1]-1)<2e-5?1:-1;
+        if (x<0||y<0) return false;
+        seen.add(`${x},${y}`);
+    }
+    return seen.size===4;
+}
+function ocNativeUvRect(q,uv,count) {
+    if (!ocIsCarrierRectangle(q,count)) return null;
+    const a=ocUvAffine(q,uv); if (!a) return null;
+    if (Math.abs(a.u[1])>2e-5 || Math.abs(a.v[0])>2e-5) return null;
+    return {u0:a.u[2],u1:a.u[0]+a.u[2],v0:a.v[2],v1:a.v[1]+a.v[2]};
+}
+
+function buildStaticSurfacePlan(firstObj,data,cfg,allowNative) {
+    const modelPoint=p=>[p[0]*cfg.scale+cfg.offset[0]+0.5,p[1]*cfg.scale+cfg.offset[1],p[2]*cfg.scale+cfg.offset[2]+0.5];
+    const primitives=[];
+    let customCount=0,nativeCount=0;
+    for (let fi=0;fi<firstObj.faces.length;fi++) {
+        const face=firstObj.faces[fi],count=face.length;
+        const sourceP=face.map(r=>modelPoint(firstObj.positions[r[0]]));
+        const uv=[]; const posIds=[];
+        for (let k=0;k<count;k++) {
+            const vi=data.vertices[fi*4+k];
+            uv.push(data.uvs[vi[1]]||[0,0]); posIds.push(vi[0]);
+        }
+        const candidates=ocCarrierCandidates(sourceP);
+        if (!candidates.length) throw new Error(`Normalized face ${fi} is degenerate.`);
+        let best=null;
+        for (const c of candidates) {
+            const qn=c.q.map(v=>[(v[0]-c.mn[0])/c.w,(v[1]-c.mn[1])/c.h]);
+            const nativeUv=allowNative?ocNativeUvRect(qn,uv,count):null;
+            const score=nativeUv?-1:c.area;
+            if (!best || score<best.score-1e-12) best={...c,qn,nativeUv,score};
+        }
+        const p=sourceP.slice(),q=best.qn.slice(),uv4=uv.slice(),ids=posIds.slice();
+        if (count===3) { p.push(p[2]);q.push(q[2]);uv4.push(uv4[2]);ids.push(ids[2]); }
+        let ownerBits=0;
+        for (let k=0;k<count;k++) if (ids[k]<ids[(k+1)%count]) ownerBits|=1<<k;
+        const shape=ocIsCarrierRectangle(q,count)?0:(count===3?1:2);
+        const center=oc3vAdd(sourceP[0],oc3vAdd(oc3vMul(best.U,(best.mn[0]+best.mx[0])*0.5),oc3vMul(best.V,(best.mn[1]+best.mx[1])*0.5)));
+        const primitive={fi,count,p,uv:uv4,q,posIds:ids,ownerBits,shape,center,U:best.U,V:best.V,N:best.N,w:best.w,h:best.h,nativeUv:best.nativeUv,native:!!best.nativeUv};
+        if (primitive.native) nativeCount++; else { primitive.customIndex=customCount++; }
+        primitives.push(primitive);
+    }
+    return {primitives,customCount,nativeCount};
+}
+
+function writeStaticSurfaceElements(plan,cfg,tw,ty,headerRows,metaH,texH,put,faceEmission) {
+    const RANGE_MIN=-16,RANGE_MAX=32;
+    const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+    const enc01=v=>{const u=Math.round(clamp(Number.isFinite(v)?v:0,0,1)*65535);return[(u>>8)&255,u&255];};
+    const enc01Bit=(v,bit)=>{let u=Math.round(clamp(Number.isFinite(v)?v:0,0,1)*65534);u=(u&65534)|(bit&1);return[(u>>8)&255,u&255];};
+    const putLinear=(linear,rgba)=>put(linear%tw,Math.floor(linear/tw),rgba[0],rgba[1],rgba[2],rgba[3]);
+    const deg=r=>r*180/Math.PI;
+    function eulerXYZFromColumns(c0,c1,c2){
+        const r00=c0[0],r10=c0[1],r20=c0[2],r11=c1[1],r21=c1[2],r12=c2[1],r22=c2[2];
+        const y=Math.asin(clamp(-r20,-1,1)),cy=Math.cos(y);let x,z;
+        if(Math.abs(cy)>1e-6){x=Math.atan2(r21,r22);z=Math.atan2(r10,r00);}else{x=Math.atan2(-r12,r11);z=0;}
+        const clean=v=>Math.abs(v)<1e-7?0:deg(v);return[clean(x),clean(y),clean(z)];
+    }
+    const elements=[];const bmin=[Infinity,Infinity,Infinity],bmax=[-Infinity,-Infinity,-Infinity];
+    const textureBaseY=headerRows+metaH;
+    for (const pr of plan.primitives) {
+        const from=[(pr.center[0]-pr.w*0.5)*16,(pr.center[1]-pr.h*0.5)*16,pr.center[2]*16];
+        const to=[(pr.center[0]+pr.w*0.5)*16,(pr.center[1]+pr.h*0.5)*16,pr.center[2]*16];
+        const origin=pr.center.map(v=>v*16),rot=eulerXYZFromColumns(pr.U,pr.V,oc3vMul(pr.N,-1));
+        let faceUv;
+        if (pr.native) {
+            faceUv=[
+                pr.nativeUv.u0*16,
+                (textureBaseY+pr.nativeUv.v0*texH)/ty*16,
+                pr.nativeUv.u1*16,
+                (textureBaseY+pr.nativeUv.v1*texH)/ty*16,
+            ];
+        } else {
+            const metaBase=headerRows*tw+pr.customIndex*OC_STATIC_META_STRIDE;
+            const px=metaBase%tw,py=Math.floor(metaBase/tw);
+            put(px,py,Math.trunc(px/256)%256,px%256,Math.trunc(py/256)%256,py%256);
+            const packedFlags=(pr.shape&3)|((pr.ownerBits&15)<<2);
+            // Hide the six flag bits in the least-significant bit of six q16
+            // coordinates. That preserves 15-bit geometry precision and removes
+            // one whole metadata texel/fetch per provoking vertex.
+            for(let k=0;k<4;k++){
+                const bx=(k*2<6)?((packedFlags>>(k*2))&1):0;
+                const by=(k*2+1<6)?((packedFlags>>(k*2+1))&1):0;
+                const [qxH,qxL]=enc01Bit(pr.q[k][0],bx),[qyH,qyL]=enc01Bit(pr.q[k][1],by);
+                putLinear(metaBase+1+k,[qxH,qxL,qyH,qyL]);
+                const [uH,uL]=enc01(pr.uv[k][0]),[vH,vL]=enc01(pr.uv[k][1]);
+                putLinear(metaBase+5+k,[uH,uL,vH,vL]);
+            }
+            faceUv=[(px+0.1)*16/tw,(py+0.1)*16/ty,(px+0.9)*16/tw,(py+0.9)*16/ty];
+        }
+        const elem={from,to,rotation:{origin,x:rot[0],y:rot[1],z:rot[2],rescale:false},faces:{north:{uv:faceUv,texture:'#0',tintindex:0}}};
+        if (faceEmission[pr.fi]>0) elem.light_emission=faceEmission[pr.fi];
+        if (cfg.noshadow) elem.shade=false;
+        elements.push(elem);
+        for(let a=0;a<3;a++){bmin[a]=Math.min(bmin[a],from[a],to[a]);bmax[a]=Math.max(bmax[a],from[a],to[a]);}
+    }
+    for(let a=0;a<3;a++) if(bmin[a]<RANGE_MIN-1e-4||bmax[a]>RANGE_MAX+1e-4)
+        throw new Error(`Surface-v4 carrier exceeds Minecraft's [-16,32] element range on ${'XYZ'[a]} (min ${(bmin[a]/16).toFixed(3)}, max ${(bmax[a]/16).toFixed(3)} blocks). Lower export Scale or move the model toward the origin.`);
+    return {elements,modelTransformation:null};
+}
 
     // =========================================================
     // Section 6: Pixel Encoding
@@ -2603,7 +2874,7 @@
             // GUI: handled entirely by shader header (cfg.displaySlots.gui →
             // texture meta pixels t[8..12]). Model.json display.gui must stay
             // identity, otherwise MC applies the tag on top of shader transform.
-            if (key === 'gui') continue;
+            if (key === 'gui' && !cfg.staticSurface) continue;
             // Hands: per-slot model.json owns rotation/translation AND scale now.
             // Vanilla applies display.firstperson_* verbatim (step A2 revert);
             // the shader no longer packs/applies a hand scale.
@@ -2638,7 +2909,16 @@
         if (!objContents || !objContents.length || !objContents[0])
             throw new Error('No OBJ content');
 
-        const nframes   = objContents.length;
+        const nframes = objContents.length;
+        if (nframes !== 1)
+            throw new Error('This Surface-v4-only build supports static geometry only; disable Geometry Animation.');
+        if (cfg.exportAsEquipment)
+            throw new Error('Worn equipment/armor needs live limb pose data and is unavailable in the subgroup-free Surface-v4-only build.');
+        if ((cfg.colorbehavior || []).includes('scale'))
+            throw new Error('RGB geometry scale is unavailable; use item_display transformation.scale instead.');
+        if ((cfg.colorbehavior || []).includes('time'))
+            throw new Error('RGB geometry-time control requires geometry animation and is unavailable in this static-only build.');
+        cfg.staticSurface = true;
 
         // Determine texture(s): atlas if multiple textures referenced, else single
         let texData; // { data, width, height }
@@ -2759,18 +3039,8 @@
         const texFrametime = Math.max(1, Math.round(cfg.texFrametime || 1));
         const texFade = !!cfg.texFade;
 
-        // Armor only: re-center each part's geometry on its own anchor so the
-        // calibrated AOFF (measured at BB origin) holds wherever the artist places a
-        // part. Item/GUI exports keep their absolute placement (display handles it).
-        let faceToPart = null, partRef = null;
-        if (cfg.exportAsEquipment) {
-            const f0 = parseObj(objContents[0], 0);
-            faceToPart = (Array.isArray(cfg.selectedPieces) && cfg.selectedPieces.length)
-                ? buildFaceToPart(f0.faceGroups, f0.faceBlocks) // per-piece: each face -> its part
-                : f0.faces.map(() => 0);                        // legacy single-part: whole model as one unit
-            partRef = computePartCenters(f0, faceToPart);
-        }
-        const { data, nfaces, faceGroups, faceBlocks, uvClamped } = buildVertexData(objContents, atlasInfo, partRef, faceToPart);
+        const { data, firstObj, nfaces, faceGroups, faceBlocks, uvClamped, normalizationStats } = buildVertexData(objContents, atlasInfo);
+        const faceToPart = null;
         const emissiveMap = collectEmissiveMap();
         const faceEmission = faceGroups.map(g => {
             const tk = parseFaceToken(g);                 // armor: emissive baked into the token
@@ -2779,46 +3049,12 @@
         if (nfaces === 0) throw new Error('No faces found in OBJ');
         const nvertices = nfaces * 4;
 
-        const uvH  = Math.ceil(nfaces / tw);
         const texH = th;
-        const vpH  = Math.ceil(data.positions.length * 3 / tw);
-        const vtH  = Math.ceil(data.uvs.length * 2 / tw);
-        const vH   = Math.ceil(data.vertices.length * 2 / tw); // includes all frames
+        const vpH = 0, vtH = 0, vH = 0;
 
-        // --- Encoder safety guards: fail loudly instead of silently corrupting the PNG ---
-        const BYTE24_MAX = 16777215; // u24() holds 0..2^24-1; larger values wrap mod 2^24
-        if (!Number.isFinite(cfg.scale))
-            throw new Error(`Scale is not a finite number (got ${cfg.scale}).`);
-        // No scale UI input; a legacy/corrupt non-positive scale would silently collapse
-        // the model. Coerce to 1 (the default) rather than block export with a dead-end.
-        if (cfg.scale <= 0) cfg.scale = 1;
+        if (!Number.isFinite(cfg.scale) || cfg.scale <= 0) cfg.scale = 1;
         if (!Array.isArray(cfg.offset) || !cfg.offset.every(Number.isFinite))
             throw new Error(`Offset X/Y/Z must be finite numbers (got ${cfg.offset && cfg.offset.join(', ')}).`);
-        // Position codec: byte24 = 8388608 + v_world*65536, decodable only in [-128, +128).
-        // (Y check includes the -0.5 block-centre re-anchor baked at write time.)
-        for (let pi = 0; pi < data.positions.length; pi++) {
-            const p = data.positions[pi];
-            for (let a = 0; a < 3; a++) {
-                const w = p[a] * cfg.scale + cfg.offset[a] - (a === 1 ? 0.5 : 0);
-                if (!Number.isFinite(w))
-                    throw new Error(`Vertex coordinate became NaN/Infinity — check Scale/Offset.`);
-                if (w < -128 || w >= 128)
-                    throw new Error(`Model out of range: a vertex reaches ${w.toFixed(2)} on axis ${'XYZ'[a]}; must stay within [-128, 128) after scale+offset. Lower Scale or shrink the model.`);
-            }
-        }
-        // Vertex/UV indices are stored as 24-bit values (u24) — must not exceed the limit.
-        if (data.positions.length > BYTE24_MAX)
-            throw new Error(`Too many unique positions (${data.positions.length} > ${BYTE24_MAX}) for a 24-bit index — use fewer animation frames or a lower-poly model.`);
-        if (data.uvs.length > BYTE24_MAX)
-            throw new Error(`Too many unique UVs (${data.uvs.length} > ${BYTE24_MAX}) for a 24-bit index.`);
-        // Header packs vpH/vtH as 16-bit (th is already checked above).
-        if (vpH > 65535 || vtH > 65535)
-            throw new Error(`Encoded data section too tall (positions ${vpH}, uvs ${vtH} rows; max 65535) — use a wider texture or fewer frames.`);
-
-        const headerRows = 2;
-        let ty = headerRows + uvH + texH + vpH + vtH + vH;
-        if (!cfg.nopow) ty = 1 << Math.ceil(Math.log2(ty || 1));
-
 
         const cbArr = ['direct','time','scale','overlay','hurt'];
         const ca = cfg.colorbehavior.map(x => {
@@ -2826,8 +3062,17 @@
             if (idx < 0) throw new Error('Unknown colorbehavior: ' + x);
             return idx;
         });
-        const cb  = (ca[0]<<6)|(ca[1]<<3)|ca[2];
-        const dur = cfg.duration === 0 ? nframes : cfg.duration;
+        const cb = (ca[0]<<6)|(ca[1]<<3)|ca[2];
+        const dur = 1;
+        const staticTexAnimActive = ntextures > 1 || atlasBands.length > 0;
+        const allowNative = !staticTexAnimActive && cb === 0 && !cfg.noshadow;
+        const surfacePlan = buildStaticSurfacePlan(firstObj, data, cfg, allowNative);
+        if (surfacePlan.primitives.length !== nfaces)
+            throw new Error(`Surface planning lost faces (${surfacePlan.primitives.length}/${nfaces}).`);
+        const uvH = Math.ceil(surfacePlan.customCount * OC_STATIC_META_STRIDE / tw);
+        const headerRows = 2;
+        let ty = headerRows + uvH + texH;
+        if (!cfg.nopow) ty = 1 << Math.ceil(Math.log2(ty || 1));
 
         const buf = new Uint8Array(tw * ty * 4);
         const put = (x, y, r, g, b, a=255) => {
@@ -2891,7 +3136,7 @@
 
         // Row 0 — header. marker.a=255 (alpha=255 prevents GUI alpha-premultiplication
         // from corrupting RGB; legacy marker.a=78 broke GUI rendering for this reason).
-        put(0, 0, 12, 34, 56, 255);
+        put(0, 0, 12, 34, 57, 255);
         put(1, 0, Math.trunc(tw/256), tw%256, Math.trunc(frameH/256), 255);
         put(2, 0, Math.trunc(nvertices/16777216)%256, Math.trunc(nvertices/65536)%256,
                   Math.trunc(nvertices/256)%256, 255);
@@ -2899,7 +3144,7 @@
                   nframes%256, ntextures);
         put(4, 0, Math.trunc(dur/65536)%256, Math.trunc(dur/256)%256, dur%256,
                   128|(cfg.autoplay?64:0)|(cfg.easing<<4)|(cfg.interpolation<<2));
-        put(5, 0, Math.trunc(vpH/256)%256, vpH%256, Math.trunc(vtH/256)%256, 255);
+        put(5, 0, Math.trunc(uvH/256)%256, uvH%256, 0, 255);
         // t[6].r bits: 7=noshadow, 6..5=autorotate, 4..2=visibility,
         //   1=hasStaticDisplay (step A1 gate), 0=colorbehavior high bit.
         // t[6].b = GUI header version (display-1:1 step B): 2 = q16 GUI layout in
@@ -2907,8 +3152,8 @@
         // encoder wrote 255 here) cannot desync from the q16 decode. A stays 255.
         put(6, 0,
             ((cfg.noshadow?1:0)<<7)|(cfg.autorotate<<5)|(cfg.visibility<<2)|((staticDisplay?1:0)<<1)|Math.trunc(cb/256),
-            cb%256, 2, 255);
-        put(7, 0, frameH%256, nvertices%256, vtH%256, 255);
+            cb%256, 5, 255);
+        put(7, 0, frameH%256, nvertices%256, 0, 255);
         // GUI shader meta at q16 (display-1:1 step B): 8 pixels, 2 bytes/axis
         // (high,low) for scale/trans/rot/pivot. All A=255 for premultiplication
         // safety. Layout MUST match the shader decode (objmc_main.glsl GUI block):
@@ -2943,7 +3188,7 @@
         //   x=6+2i, 7+2i     — atlas band i: (y0H, y0L, fHH) / (fHL, frames, -)
         //   x=6+2B + (id-5)  — dynamic entries for ids 5..8 (B = band count)
         // Capacity is bounded by the texture width; bands are trimmed to fit.
-        const { dynamics } = assignSlotMarkers(buildDisplayTransforms(cfg));
+        const dynamics = [];
         const extraDyn = Math.max(0, dynamics.length - 4);
         const maxBands = Math.min(15, Math.floor((tw - 6 - extraDyn) / 2));
         if (atlasBands.length > maxBands) {
@@ -2977,27 +3222,12 @@
             }
         }
 
-        // UV header + JSON elements
-        const elements = [];
-        for (let i = 0; i < nfaces; i++) {
-            const px = i%tw, py = Math.floor(i/tw)+headerRows;
-            put(px, py, Math.trunc(px/256)%256, px%256, Math.trunc(py/256)%256, py%256);
-            const elem = {
-                // Carrier anchor = FaceBakery NORTH c2 = MIN corner = (8,8,8) px = block
-                // centre (0.5,0.5,0.5). The shader anchors the centred decoded model AT c2,
-                // so c2 must be the cube CENTRE, not the cube bottom. Was [8,0,8] (MIN_Y=0 =
-                // bottom) which dropped every model 0.5 block (8px) low — verified by
-                // tools/render-tester (IoU 0.47 -> 0.998 after this shift). +Y edge stays
-                // 16px (8..24) so display scale/rotation reconstruction is unchanged.
-                from: [8,8,8], to: [24,24,8],
-                faces: { north: {
-                    uv: [(px+0.1)*16/tw,(py+0.1)*16/ty,(px+0.9)*16/tw,(py+0.9)*16/ty],
-                    texture: '#0', tintindex: 0,
-                }},
-            };
-            if (faceEmission[i] > 0) elem.light_emission = faceEmission[i];
-            elements.push(elem);
-        }
+        // Surface-v4-only elements. Exact rectangular faces with simple
+        // static UVs bypass the custom shader; the remainder use compact metadata.
+        const staticSurfaceMeta = writeStaticSurfaceElements(
+            surfacePlan, cfg, tw, ty, headerRows, uvH, texH, put, faceEmission
+        );
+        const elements = staticSurfaceMeta.elements;
 
         // Texture rows
         if (atlasInfo) {
@@ -3042,51 +3272,8 @@
             }
         }
 
-        // Position data
-        let ybase = headerRows+uvH+texH;
-        // VERTICAL ORIGIN CONVENTION: the decoded frame is BLOCK-CENTRE relative
-        // (the carrier anchor c2 sits at the block centre and every display path
-        // adds decoded positions to it as-is). Blockbench models are naturally
-        // built ON the grid floor (y=0 = block bottom, like a vanilla JSON model
-        // 0..16), so bake Y - 0.5 here — then the model lands in game exactly
-        // where it stands relative to the BB grid, in EVERY context (GUI, hands,
-        // frames, ground) at once. Without this, a floor-built model rides half
-        // a block high everywhere (a centre-built model used to hide it, which
-        // is how the old per-slot lifts got mis-calibrated per model).
-        // Applied to ALL exports, equipment included, so the ITEM view of an
-        // armor export is correct in EVERY display slot (an element-shift
-        // compensation only worked at identity display — the shifted anchor
-        // rotates with the display). The armor shader path adds the +0.5 back in
-        // the SAME decoded model frame (before its part re-anchoring/rotation),
-        // so armor on entities is byte-equivalent to the pre-convention state.
-        const bakeOffset = [cfg.offset[0], cfg.offset[1] - 0.5, cfg.offset[2]];
-        for (let i = 0; i < data.positions.length; i++) {
-            for (const [j, pxArr] of posPixels(data.positions[i], cfg.scale, bakeOffset).entries()) {
-                const p = i*3+j;
-                put(p%tw, ybase+Math.floor(p/tw), ...pxArr);
-            }
-        }
-
-        // UV data
-        ybase += vpH;
         if (uvClamped || data.uvs.some(uv => uv.some(v => v < -1e-6 || v > 1 + 1e-6)))
             surfaceWarning('some UVs fall outside the 0..1 frame (tiling/negative) and were clamped — those faces may look wrong. Keep the model UV-mapped inside the texture frame.');
-        for (let i = 0; i < data.uvs.length; i++) {
-            for (const [j, pxArr] of uvPixels(data.uvs[i]).entries()) {
-                const p = i*2+j;
-                put(p%tw, ybase+Math.floor(p/tw), ...pxArr);
-            }
-        }
-
-        // Vertex data (all frames)
-        ybase += vtH;
-        for (let i = 0; i < data.vertices.length; i++) {
-            const pixels = vertPixels(data.vertices[i]);
-            for (const [j, pxArr] of pixels.entries()) {
-                const p = i*2+j;
-                put(p%tw, ybase+Math.floor(p/tw), ...pxArr);
-            }
-        }
 
         // Round-trip verification: decode a few entries from the buffer
         // using the same logic the shader uses, and compare with source data.
@@ -3103,7 +3290,7 @@
                 'uvStart[0]=', rd(0,headerRows), 'posStart[0]=', rd(0,headerRows+uvH+texH));
             // Verify marker
             const mk = rd(0, 0);
-            if (mk[0]!==12||mk[1]!==34||mk[2]!==56||mk[3]!==255) {
+            if (mk[0]!==12||mk[1]!==34||mk[2]!==57||mk[3]!==255) {
                 verifyWarns.push('marker mismatch');
                 console.error('[obj3-verify] MARKER MISMATCH:', mk);
             }
@@ -3114,57 +3301,16 @@
             const decNf = Math.max(h3[0]*65536+h3[1]*256+h3[2], 1);
             if (decNv !== nvertices) { verifyWarns.push('nvertices mismatch'); console.error(`[obj3-verify] nvertices: encoded=${decNv} expected=${nvertices}`); }
             if (decNf !== nframes)   { verifyWarns.push('nframes mismatch');   console.error(`[obj3-verify] nframes: encoded=${decNf} expected=${nframes}`); }
-            // Verify first position (shader decodes as v*scale+offset)
-            const posBase = headerRows + uvH + texH;
-            const px0 = rd(0, posBase), px1 = rd(1, posBase), px2 = rd(2, posBase);
-            const decPos = [
-                (px0[0]/255*256 + px0[1]/255 + px0[2]/255/256) * (255/256) - 128,
-                (px1[0]/255*256 + px1[1]/255 + px1[2]/255/256) * (255/256) - 128,
-                (px2[0]/255*256 + px2[1]/255 + px2[2]/255/256) * (255/256) - 128,
-            ];
-            const srcPos = data.positions[0];
-            // Expected = what the encoder actually baked (incl. the -0.5 Y
-            // block-centre re-anchor for non-armor exports).
-            const expPos = srcPos.map((v,j) => v * cfg.scale + bakeOffset[j]);
-            const posDiff = Math.abs(decPos[0]-expPos[0])+Math.abs(decPos[1]-expPos[1])+Math.abs(decPos[2]-expPos[2]);
-            if (posDiff > 0.01) { verifyWarns.push('pos[0] mismatch'); console.error(`[obj3-verify] pos[0] MISMATCH: exp=[${expPos.map(v=>v.toFixed(4))}] dec=[${decPos.map(v=>v.toFixed(4))}]`); }
-            // Verify first UV coordinate (uvPixels writes u24(clamp(v)*65535) at the
-            // UV-float section base; mirror the encoder's write base + the shader's
-            // /65535 read). Catches a regression in the clamp / scaling math.
-            const uvBase = headerRows + uvH + texH + vpH;
-            const uv0u = rd(0, uvBase), uv0v = rd(1, uvBase);
-            const decUv = [
-                (uv0u[0]*65536 + uv0u[1]*256 + uv0u[2]) / 65535,
-                (uv0v[0]*65536 + uv0v[1]*256 + uv0v[2]) / 65535,
-            ];
-            const srcUv = data.uvs[0];
-            if (srcUv) {
-                const expUv = srcUv.map(v => Math.max(0, Math.min(1, v)));
-                const uvEps = 2/65535;
-                if (Math.abs(decUv[0]-expUv[0]) > uvEps || Math.abs(decUv[1]-expUv[1]) > uvEps) {
-                    verifyWarns.push('uv[0] value mismatch');
-                    console.error(`[obj3-verify] uv[0] MISMATCH: exp=[${expUv.map(v=>v.toFixed(5))}] dec=[${decUv.map(v=>v.toFixed(5))}]`);
+
+                if (surfacePlan.customCount > 0) {
+                    const m0 = rd(0, headerRows);
+                    const mx = m0[0] * 256 + m0[1];
+                    const my = m0[2] * 256 + m0[3];
+                    if (mx !== 0 || my !== headerRows) {
+                        verifyWarns.push('static metadata pointer mismatch');
+                        console.error(`[obj3-verify] static pointer: enc=[${mx},${my}] expected=[0,${headerRows}]`);
+                    }
                 }
-            }
-            // Verify first vertex data entry
-            const vtxBase = headerRows + uvH + texH + vpH + vtH;
-            const va = rd(0, vtxBase), vb = rd(1, vtxBase);
-            const decPi = va[0]*65536+va[1]*256+va[2];
-            const decUi = vb[0]*65536+vb[1]*256+vb[2];
-            const srcVert = data.vertices[0];
-            if (decPi !== srcVert[0]) { verifyWarns.push('vert[0].pos mismatch'); console.error(`[obj3-verify] vert[0].pos: encoded=${decPi} expected=${srcVert[0]}`); }
-            if (decUi !== srcVert[1]) { verifyWarns.push('vert[0].uv mismatch');  console.error(`[obj3-verify] vert[0].uv: encoded=${decUi} expected=${srcVert[1]}`); }
-            // Verify last frame's first vertex
-            if (nframes > 1) {
-                const lastIdx = (nframes-1) * nvertices;
-                const lp = lastIdx * 2;
-                const la = rd(lp%tw, vtxBase+Math.floor(lp/tw));
-                const decLPi = la[0]*65536+la[1]*256+la[2];
-                const srcLast = data.vertices[lastIdx];
-                if (srcLast) {
-                    if (decLPi !== srcLast[0]) { verifyWarns.push('last frame mismatch'); console.error(`[obj3-verify] vert[${lastIdx}].pos: enc=${decLPi} exp=${srcLast[0]}`); }
-                }
-            }
         } catch(e) { verifyWarns.push('verify error'); console.error('[obj3-verify] error:', e.message); }
 
         // Block a corrupt export: any hard integrity mismatch (marker / counts /
@@ -3180,9 +3326,11 @@
         const warnStr = verifyWarns.length
             ? t('warn_suffix').replace('{n}', verifyWarns.length).replace('{w}', tPlural(verifyWarns.length, 'warnings'))
             : '';
-        const debugInfo = `${nfaces} ${tPlural(nfaces, 'faces')} · ${nframes} ${tPlural(nframes, 'frames')} · ${tw}×${ty}px` + warnStr;
+        const debugInfo = `${nfaces} ${tPlural(nfaces, 'faces')} · ${nframes} ${tPlural(nframes, 'frames')} · ${tw}×${ty}px` + ` · surface-v4-only · native ${surfacePlan.nativeCount} · shader ${surfacePlan.customCount} · split +${normalizationStats.splitExtra}` + warnStr;
 
-        return { pngBuffer, rawBuf: buf, elements, nfaces, nvertices, nframes, tw, ty, debugInfo, faceGroups, faceBlocks, faceToPart, faceEmission };
+        return { pngBuffer, rawBuf: buf, elements, nfaces, nvertices, nframes, tw, ty, debugInfo, faceGroups, faceBlocks, faceToPart, faceEmission,
+            staticSurface: true,
+            staticModelTransformation: staticSurfaceMeta ? staticSurfaceMeta.modelTransformation : null };
     }
 
     // =========================================================
@@ -3331,7 +3479,10 @@
     // 0.65-midpoint rule in the shader.
     const SLOT_MARKER = { NEUTRAL: 0, DYN_MIN: 1, DYN_MAX: 8 };
     const slotMarkerMid = (id) => 0.5 + id * 0.035;
-    function calibratedElementsForSlot(baseElements, slot, markerId) {
+    function calibratedElementsForSlot(baseElements, slot, markerId, staticSurface) {
+        // Surface carriers are the real model geometry. Legacy anchor and
+        // UV marker calibration applies only to flat carriers.
+        if (staticSurface) return baseElements;
         const off = SLOT_OFFSETS[slot] || { x: 0, y: 0, z: 0 };
         const id = markerId || 0;
         if (off.x === 0 && off.y === 0 && off.z === 0 && id === 0) return baseElements;
@@ -3387,19 +3538,17 @@
     // Every exported slot gets its own case; contexts without one fall back to
     // the NEUTRAL `<name>_default` json (marker id 0) — never to a slot json,
     // whose v2 slot marker would leak that slot's Z scale into other contexts.
-    function buildDisplayContextModel(modelBaseName, exportedSlots) {
+    function buildDisplayContextModel(modelBaseName, exportedSlots, modelTransformation) {
         const tints = [{ type: 'minecraft:potion', default: -1 }];
         const ref = slot => `${EXPORT_NS}:item/${modelBaseName}_${slot}`;
-        const cases = (exportedSlots || DISPLAY_SLOTS)
-            .map(slot => ({
-                when: slot,
-                model: { type: 'minecraft:model', model: ref(slot), tints },
-            }));
-        const fallbackModel = {
-            type: 'minecraft:model',
-            model: ref('default'),
-            tints,
+        const modelFor = slot => {
+            const node = { type: 'minecraft:model', model: ref(slot), tints };
+            if (modelTransformation) node.transformation = modelTransformation;
+            return node;
         };
+        const cases = (exportedSlots || DISPLAY_SLOTS)
+            .map(slot => ({ when: slot, model: modelFor(slot) }));
+        const fallbackModel = modelFor('default');
         if (cases.length === 0) return fallbackModel;
         return {
             type: 'minecraft:select',
@@ -3414,7 +3563,7 @@
     // by modelBaseName, with a vanilla fallback. A second model on the same
     // baseItem coexists by adding another custom_model_data case (see merge in
     // saveSingleOutput).
-    function buildItemSelector(modelBaseName, exportedSlots, baseItem) {
+    function buildItemSelector(modelBaseName, exportedSlots, baseItem, modelTransformation) {
         const base = baseItem || 'iron_ingot';
         return {
             // MANDATORY: default `true` makes Minecraft replay the item-swap
@@ -3426,7 +3575,7 @@
                 property: 'minecraft:custom_model_data',
                 index: 0,
                 cases: [
-                    { when: modelBaseName, model: buildDisplayContextModel(modelBaseName, exportedSlots) },
+                    { when: modelBaseName, model: buildDisplayContextModel(modelBaseName, exportedSlots, modelTransformation) },
                 ],
                 fallback: { type: 'minecraft:model', model: `minecraft:item/${base}` },
             },
@@ -3479,8 +3628,8 @@
 
     // Merge a new model into an existing item definition: replace the case for
     // modelBaseName if present, else append it. Returns the merged object.
-    function mergeItemSelector(existing, modelBaseName, exportedSlots) {
-        const node = buildDisplayContextModel(modelBaseName, exportedSlots);
+    function mergeItemSelector(existing, modelBaseName, exportedSlots, modelTransformation) {
+        const node = buildDisplayContextModel(modelBaseName, exportedSlots, modelTransformation);
         const cases = existing.model.cases.filter(c => c.when !== modelBaseName);
         cases.push({ when: modelBaseName, model: node });
         existing.model.cases = cases;
@@ -3490,22 +3639,26 @@
         return existing;
     }
 
-    // assets/minecraft/atlases/blocks.json — ensures the objcubed item
-    // textures are stitched into the block atlas (the atlas the objmc shaders
-    // sample). A directory source with source 'item' picks up every
-    // assets/<ns>/textures/item/*.png across all namespaces and registers it as
-    // <ns>:item/<file>, which is exactly the ref buildSlotModelJson emits.
-    function buildBlocksAtlas() {
-        return { sources: [{ type: 'minecraft:directory', source: 'item', prefix: 'item/' }] };
+    // Add only exported obj³ textures to blocks.png. A broad `item/`
+    // directory source also captures every vanilla item and causes multi-atlas
+    // model-bake failures on 26.2.
+    function objCubedAtlasSource(modelName) {
+        const id = `${EXPORT_NS}:item/${modelName}`;
+        return { type: 'minecraft:single', resource: id, sprite: id };
     }
-
-    // Add (idempotently) the item directory source to an existing parsed atlas.
-    function mergeBlocksAtlas(existing) {
-        const sources = Array.isArray(existing.sources) ? existing.sources : [];
-        const has = sources.some(s => s &&
+    function buildBlocksAtlas(modelName) {
+        return { sources: [objCubedAtlasSource(modelName)] };
+    }
+    function mergeBlocksAtlas(existing, modelName) {
+        let sources = Array.isArray(existing.sources) ? existing.sources : [];
+        sources = sources.filter(s => !(s &&
             (s.type === 'minecraft:directory' || s.type === 'directory') &&
-            s.source === 'item' && (s.prefix === 'item/' || s.prefix === 'item'));
-        if (!has) sources.push({ type: 'minecraft:directory', source: 'item', prefix: 'item/' });
+            s.source === 'item' && (s.prefix === 'item/' || s.prefix === 'item')));
+        const source = objCubedAtlasSource(modelName);
+        const has = sources.some(s => s &&
+            (s.type === 'minecraft:single' || s.type === 'single') &&
+            s.resource === source.resource && (s.sprite || s.resource) === source.sprite);
+        if (!has) sources.push(source);
         existing.sources = sources;
         return existing;
     }
@@ -3551,13 +3704,15 @@
                        tr[0]===0 && tr[1]===0 && tr[2]===0 &&
                        s[0]===1 && s[1]===1 && s[2]===1;
             };
-            const exportedSlots = DISPLAY_SLOTS.filter(slot => {
-                if (slot === FALLBACK_SLOT) return true;
-                const off = SLOT_OFFSETS[slot] || { x:0, y:0, z:0 };
-                if (off.x !== 0 || off.y !== 0 || off.z !== 0) return true;
-                if (displayTransforms[slot] && !isIdentity(displayTransforms[slot])) return true;
-                return false;
-            });
+            const exportedSlots = result.staticSurface
+                ? DISPLAY_SLOTS.slice()
+                : DISPLAY_SLOTS.filter(slot => {
+                    if (slot === FALLBACK_SLOT) return true;
+                    const off = SLOT_OFFSETS[slot] || { x:0, y:0, z:0 };
+                    if (off.x !== 0 || off.y !== 0 || off.z !== 0) return true;
+                    if (displayTransforms[slot] && !isIdentity(displayTransforms[slot])) return true;
+                    return false;
+                });
 
             // Per-slot model JSONs → assets/objcubed/models/item/<modelName>_<slot>.json.
             //
@@ -3608,7 +3763,7 @@
                 fs.writeFileSync(
                     path.join(modelsDir, `${modelName}_${fileSlot}.json`),
                     buildSlotModelJson(modelName, fileSlot, slotDisplay,
-                        calibratedElementsForSlot(result.elements, displayLookupSlot, markerId)),
+                        calibratedElementsForSlot(result.elements, displayLookupSlot, markerId, result.staticSurface)),
                     'utf8'
                 );
             };
@@ -3629,15 +3784,15 @@
                 let existing = null;
                 try { existing = JSON.parse(fs.readFileSync(itemPath, 'utf8')); } catch (e) { existing = null; }
                 if (existing && isMergeableItemSelector(existing)) {
-                    itemObj = mergeItemSelector(existing, modelName, exportedSlots);
+                    itemObj = mergeItemSelector(existing, modelName, exportedSlots, result.staticModelTransformation);
                     // Keep vanilla fallback pointed at the requested base item.
                     itemObj.model.fallback = { type: 'minecraft:model', model: `minecraft:item/${baseItem}` };
                 } else {
                     try { fs.writeFileSync(itemPath + '.bak', fs.readFileSync(itemPath)); } catch (e) {}
-                    itemObj = buildItemSelector(modelName, exportedSlots, baseItem);
+                    itemObj = buildItemSelector(modelName, exportedSlots, baseItem, result.staticModelTransformation);
                 }
             } else {
-                itemObj = buildItemSelector(modelName, exportedSlots, baseItem);
+                itemObj = buildItemSelector(modelName, exportedSlots, baseItem, result.staticModelTransformation);
             }
             // Atomic write: this file aggregates EVERY model's custom_model_data case on
             // this base item, so a half-written/interrupted overwrite would destroy them
@@ -3665,9 +3820,9 @@
             if (fs.existsSync(blocksAtlasPath)) {
                 let existing = null;
                 try { existing = JSON.parse(fs.readFileSync(blocksAtlasPath, 'utf8')); } catch (e) { existing = null; }
-                atlasObj = (existing && typeof existing === 'object') ? mergeBlocksAtlas(existing) : buildBlocksAtlas();
+                atlasObj = (existing && typeof existing === 'object') ? mergeBlocksAtlas(existing, modelName) : buildBlocksAtlas(modelName);
             } else {
-                atlasObj = buildBlocksAtlas();
+                atlasObj = buildBlocksAtlas(modelName);
             }
             fs.writeFileSync(blocksAtlasPath, JSON.stringify(atlasObj, null, 2), 'utf8');
 
@@ -5228,6 +5383,14 @@
                         this.statusKind = 'progress';
                         this.status  = t('status_building');
                         try {
+                            if (this.hasAnims && this.animationEnabled)
+                                throw new Error('Geometry Animation is disabled in the subgroup-free Surface-v4-only build.');
+                            if (this.exportAsEquipment)
+                                throw new Error('Equipment/armor export is disabled in the subgroup-free Surface-v4-only build.');
+                            if (cbParts.includes('scale'))
+                                throw new Error('RGB geometry scale is disabled; use item_display transformation.scale.');
+                            if (cbParts.includes('time'))
+                                throw new Error('RGB geometry-time control is disabled because this build has no geometry animation.');
                             const cfg = {
                                 texIndex:        +this.selectedTex,
                                 useAtlas:        !!this.useAtlas,
@@ -5238,6 +5401,8 @@
                                 scale:           +this.scale,
                                 offset:          [+this.offsetX, +this.offsetY, +this.offsetZ],
                                 animationEnabled: this.hasAnims && this.animationEnabled,
+                                // This fork intentionally has one backend only.
+                                staticSurface: true,
                                 animationIndex:  +this.animationIndex,
                                 animFps:         +this.animFps,
                                 animStart:       +this.animStart,
@@ -6077,7 +6242,7 @@
         module.exports.__test = {
             generateDatapackFiles, buildItemSelector, mergeItemSelector, saveSingleOutput, buildOutput,
             buildSlotModelJson,
-            buildVertexData, buildDisplayTransforms, hasStaticWorldDisplay,
+            buildVertexData, normalizeStaticObj, buildStaticSurfacePlan, buildDisplayTransforms, hasStaticWorldDisplay,
             ensureDataRoot, loadActiveSettings, saveActiveSettings,
             computePartCenters, buildFaceToPart, collectBodyPartTags, applyBodyPartTags, parseFaceToken,
             calibratedElementsForSlot,
