@@ -1,5 +1,5 @@
-// OC_HYBRID_SURFACE_PATCH_v1_2
-// OC_HYBRID_SURFACE_PATCH_v1_2
+// OC_HYBRID_SURFACE_PATCH_v1_3
+// OC_HYBRID_SURFACE_PATCH_v1_3
 // obj³ static-surface backend.
 // This file is inserted at the beginning of objmc_main.glsl by the patcher.
 // It is included INSIDE main(), so it intentionally contains statements only.
@@ -35,7 +35,6 @@ if (ocMarker == ivec4(12, 34, 56, 255)) {
     ivec4 ocT1 = getmeta(ocTopLeft, 1);
     ivec4 ocT2 = getmeta(ocTopLeft, 2);
     ivec4 ocT3 = getmeta(ocTopLeft, 3);
-    ivec4 ocT4 = getmeta(ocTopLeft, 4);
     ivec4 ocT5 = getmeta(ocTopLeft, 5);
     ivec4 ocT6 = getmeta(ocTopLeft, 6);
     ivec4 ocT7 = getmeta(ocTopLeft, 7);
@@ -110,16 +109,17 @@ if (ocMarker == ivec4(12, 34, 56, 255)) {
             ivec2 ocI1 = getvert(ocTopLeft, ocSize.x, ocDataHeight + ocVph + ocVth, ocVertexBase + 1);
             ivec2 ocI2 = getvert(ocTopLeft, ocSize.x, ocDataHeight + ocVph + ocVth, ocVertexBase + 2);
             ivec2 ocI3 = getvert(ocTopLeft, ocSize.x, ocDataHeight + ocVph + ocVth, ocVertexBase + 3);
+            bool ocTriangle = all(equal(ocI2, ocI3));
 
             vec3 ocP0 = getpos(ocTopLeft, ocSize.x, ocDataHeight, ocI0.x);
             vec3 ocP1 = getpos(ocTopLeft, ocSize.x, ocDataHeight, ocI1.x);
             vec3 ocP2 = getpos(ocTopLeft, ocSize.x, ocDataHeight, ocI2.x);
-            vec3 ocP3 = getpos(ocTopLeft, ocSize.x, ocDataHeight, ocI3.x);
+            vec3 ocP3 = ocTriangle ? ocP2 : getpos(ocTopLeft, ocSize.x, ocDataHeight, ocI3.x);
 
             vec2 ocUv0 = getuv(ocTopLeft, ocSize.x, ocDataHeight + ocVph, ocI0.y);
             vec2 ocUv1 = getuv(ocTopLeft, ocSize.x, ocDataHeight + ocVph, ocI1.y);
             vec2 ocUv2 = getuv(ocTopLeft, ocSize.x, ocDataHeight + ocVph, ocI2.y);
-            vec2 ocUv3 = getuv(ocTopLeft, ocSize.x, ocDataHeight + ocVph, ocI3.y);
+            vec2 ocUv3 = ocTriangle ? ocUv2 : getuv(ocTopLeft, ocSize.x, ocDataHeight + ocVph, ocI3.y);
 
             vec3 ocE10 = ocP1 - ocP0;
             vec3 ocE20 = ocP2 - ocP0;
@@ -151,9 +151,18 @@ if (ocMarker == ivec4(12, 34, 56, 255)) {
             ocSurfaceUV01 = vec4(ocUv0, ocUv1);
             ocSurfaceUV23 = vec4(ocUv2, ocUv3);
 
-            bool ocTriangle = all(equal(ocI2, ocI3));
+            // One directed owner per source edge. The fragment shader uses these
+            // bits only when interpolation places a sample microscopically outside;
+            // this closes cracks without overlapping both coplanar faces.
+            int ocOwners0 = ((ocI1.x < ocI2.x) ? 1 : 0)
+                          | ((ocI2.x < ocI0.x) ? 2 : 0)
+                          | ((ocI0.x < ocI1.x) ? 4 : 0);
+            int ocOwners1 = ((ocI2.x < ocI3.x) ? 1 : 0)
+                          | ((ocI3.x < ocI0.x) ? 2 : 0)
+                          | ((ocI0.x < ocI2.x) ? 4 : 0);
+            int ocPackedFlags = 1 | (ocOwners0 << 1) | (ocOwners1 << 4);
             ocSurfaceMap.z = ocTriangle ? 3.0 : 4.0;
-            ocSurfaceMap.w = 1.0;
+            ocSurfaceMap.w = float(ocPackedFlags);
 
             float ocTexTime = GameTime * 24000.0;
 #ifdef ENTITY
@@ -161,46 +170,45 @@ if (ocMarker == ivec4(12, 34, 56, 255)) {
             // a reload cannot freeze an arbitrary frame into the GUI atlas.
             if (isGUI == 1) ocTexTime = 0.0;
 #endif
-            ivec4 ocTexMeta = ivec4(texelFetch(Sampler0, ocTopLeft + ivec2(4, 1), 0) * 255.0 + 0.5);
+            // x=5 is the cheap gate. The x=4 clock pixel is fetched only when a
+            // whole-texture animation or atlas band actually exists.
             ivec4 ocTexFlags = ivec4(texelFetch(Sampler0, ocTopLeft + ivec2(5, 1), 0) * 255.0 + 0.5);
-            float ocTexFrameTime = max(float(ocTexMeta.r * 65536 + ocTexMeta.g * 256 + ocTexMeta.b), 1.0);
-            bool ocTexFade = (ocTexFlags.r & 1) == 1;
-            vec2 ocBase0;
-            vec2 ocBase1;
+            int ocBandCount = min(ocTexFlags.g, 15);
+            bool ocTexAnimated = ocNTextures > 1 || ocBandCount > 0;
+            float ocTexFrameTime = 1.0;
+            bool ocTexFade = false;
+            if (ocTexAnimated) {
+                ivec4 ocTexMeta = ivec4(texelFetch(Sampler0, ocTopLeft + ivec2(4, 1), 0) * 255.0 + 0.5);
+                ocTexFrameTime = max(float(ocTexMeta.r * 65536 + ocTexMeta.g * 256 + ocTexMeta.b), 1.0);
+                ocTexFade = (ocTexFlags.r & 1) == 1;
+            }
 
+            vec2 ocBase0 = vec2(ocTopLeft.x, ocTopLeft.y + ocHeaderHeight);
+            vec2 ocBase1 = ocBase0;
             if (ocNTextures > 1) {
                 int ocFrame0 = int(ocTexTime / ocTexFrameTime) % ocNTextures;
                 int ocFrame1 = (ocFrame0 + 1) % ocNTextures;
-                ocBase0 = vec2(ocTopLeft.x, ocTopLeft.y + ocHeaderHeight + ocFrame0 * ocSize.y);
-                ocBase1 = vec2(ocTopLeft.x, ocTopLeft.y + ocHeaderHeight + ocFrame1 * ocSize.y);
+                ocBase0.y += float(ocFrame0 * ocSize.y);
+                ocBase1.y += float(ocFrame1 * ocSize.y);
                 transition = ocTexFade ? fract(ocTexTime / ocTexFrameTime) : 0.0;
-            } else {
-                float ocDy0 = 0.0;
-                float ocDy1 = 0.0;
-                bool ocInBand = false;
-                int ocBandCount = min(ocTexFlags.g, 15);
-                if (ocBandCount > 0) {
-                    float ocVmid = (ocUv0.y + ocUv2.y) * 0.5 * float(ocSize.y);
-                    for (int ocB = 0; ocB < 15; ocB++) {
-                        if (ocB >= ocBandCount) break;
-                        ivec4 ocB0 = ivec4(texelFetch(Sampler0, ocTopLeft + ivec2(6 + 2 * ocB, 1), 0) * 255.0 + 0.5);
-                        ivec4 ocB1 = ivec4(texelFetch(Sampler0, ocTopLeft + ivec2(7 + 2 * ocB, 1), 0) * 255.0 + 0.5);
-                        int ocY0 = ocB0.r * 256 + ocB0.g;
-                        int ocFrameH = ocB0.b * 256 + ocB1.r;
-                        int ocFrameCount = max(ocB1.g, 1);
-                        if (ocVmid > float(ocY0) && ocVmid < float(ocY0 + ocFrameH)) {
-                            int ocF0 = int(ocTexTime / ocTexFrameTime) % ocFrameCount;
-                            int ocF1 = (ocF0 + 1) % ocFrameCount;
-                            ocDy0 = float(-ocF0 * ocFrameH);
-                            ocDy1 = float(-ocF1 * ocFrameH);
-                            ocInBand = true;
-                            break;
-                        }
+            } else if (ocBandCount > 0) {
+                float ocVmid = (ocUv0.y + ocUv2.y) * 0.5 * float(ocSize.y);
+                for (int ocB = 0; ocB < 15; ocB++) {
+                    if (ocB >= ocBandCount) break;
+                    ivec4 ocB0 = ivec4(texelFetch(Sampler0, ocTopLeft + ivec2(6 + 2 * ocB, 1), 0) * 255.0 + 0.5);
+                    ivec4 ocB1 = ivec4(texelFetch(Sampler0, ocTopLeft + ivec2(7 + 2 * ocB, 1), 0) * 255.0 + 0.5);
+                    int ocY0 = ocB0.r * 256 + ocB0.g;
+                    int ocFrameH = ocB0.b * 256 + ocB1.r;
+                    int ocFrameCount = max(ocB1.g, 1);
+                    if (ocVmid > float(ocY0) && ocVmid < float(ocY0 + ocFrameH)) {
+                        int ocF0 = int(ocTexTime / ocTexFrameTime) % ocFrameCount;
+                        int ocF1 = (ocF0 + 1) % ocFrameCount;
+                        ocBase0.y -= float(ocF0 * ocFrameH);
+                        ocBase1.y -= float(ocF1 * ocFrameH);
+                        transition = ocTexFade ? fract(ocTexTime / ocTexFrameTime) : 0.0;
+                        break;
                     }
                 }
-                ocBase0 = vec2(ocTopLeft.x, ocTopLeft.y + ocHeaderHeight) + vec2(0.0, ocDy0);
-                ocBase1 = vec2(ocTopLeft.x, ocTopLeft.y + ocHeaderHeight) + vec2(0.0, ocDy1);
-                transition = (ocInBand && ocTexFade) ? fract(ocTexTime / ocTexFrameTime) : 0.0;
             }
 
             texCoord = ocBase0 / vec2(ocAtlasSize);

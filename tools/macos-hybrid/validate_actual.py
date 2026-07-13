@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-TAG = "OC_HYBRID_SURFACE_PATCH_v1_2"
+TAG = "OC_HYBRID_SURFACE_PATCH_v1_3"
 
 
 def die(msg: str) -> None:

@@ -6,7 +6,7 @@ External workflow stays the same:
   * export to the resource-pack root
 
 Backend selection is automatic:
-  * static, non-equipment OBJ -> surface carrier format v3 (no subgroup needed)
+  * static, non-equipment OBJ -> surface carrier format v3.1 (no subgroup needed)
   * geometry animation / equipment -> original format (runs when subgroup exists)
 
 The patched shaders compile at GLSL 4.10.  The full legacy path is compiled only
@@ -24,7 +24,7 @@ import shutil
 import sys
 from pathlib import Path
 
-PATCH_TAG = "OC_HYBRID_SURFACE_PATCH_v1_2"
+PATCH_TAG = "OC_HYBRID_SURFACE_PATCH_v1_3"
 OLD_PATCH_TAG = "OC_STATIC_SURFACE_PATCH_v1"
 PREVIOUS_PATCH_TAG = "OC_HYBRID_SURFACE_PATCH_v1"
 HERE = Path(__file__).resolve().parent
@@ -420,10 +420,16 @@ def static_sample_block(legacy: str) -> str:
     if (ocSurfaceMap.w > 0.5) {{
         vec2 ocLocalUv;
         if (!ocResolveStaticUv(ocSurfaceCoord, ocSurfaceP01, ocSurfaceP23,
-                               ocSurfaceUV01, ocSurfaceUV23, ocSurfaceMap.z, ocLocalUv)) discard;
+                               ocSurfaceUV01, ocSurfaceUV23, ocSurfaceMap.z,
+                               ocSurfaceMap.w, ocLocalUv)) discard;
         vec2 ocSample0 = texCoord  + ocLocalUv * ocSurfaceMap.xy;
-        vec2 ocSample1 = texCoord2 + ocLocalUv * ocSurfaceMap.xy;
-        color = mix(texture(Sampler0, ocSample0), texture(Sampler0, ocSample1), transition);
+        vec4 ocColor0 = texture(Sampler0, ocSample0);
+        if (transition > 0.0) {{
+            vec2 ocSample1 = texCoord2 + ocLocalUv * ocSurfaceMap.xy;
+            color = mix(ocColor0, texture(Sampler0, ocSample1), transition);
+        }} else {{
+            color = ocColor0;
+        }}
     }} else {{
         color = {legacy};
     }}'''
@@ -440,7 +446,7 @@ def patch_fsh(path: Path) -> None:
 
     if path.name == "item.fsh":
         old = "    vec4 color = mix(texture(Sampler0, texCoord), texture(Sampler0, texCoord2), transition);"
-        text = replace_once(text, old, "    " + static_sample_block("mix(texture(Sampler0, texCoord), texture(Sampler0, texCoord2), transition)"), "item sample")
+        text = replace_once(text, old, "    " + static_sample_block("transition > 0.0 ? mix(texture(Sampler0, texCoord), texture(Sampler0, texCoord2), transition) : texture(Sampler0, texCoord)"), "item sample")
     elif path.name == "entity.fsh":
         old = '''    vec4 color = transition > 0.0
         ? mix(texture(Sampler0, texCoord), texture(Sampler0, texCoord2), transition)
@@ -463,10 +469,16 @@ def patch_fsh(path: Path) -> None:
     if (ocSurfaceMap.w > 0.5) {
         vec2 ocLocalUv;
         if (!ocResolveStaticUv(ocSurfaceCoord, ocSurfaceP01, ocSurfaceP23,
-                               ocSurfaceUV01, ocSurfaceUV23, ocSurfaceMap.z, ocLocalUv)) discard;
-        vec2 ocSample0 = texCoord  + ocLocalUv * ocSurfaceMap.xy;
-        vec2 ocSample1 = texCoord2 + ocLocalUv * ocSurfaceMap.xy;
-        color = mix(texture(Sampler0, ocSample0), texture(Sampler0, ocSample1), transition);
+                               ocSurfaceUV01, ocSurfaceUV23, ocSurfaceMap.z,
+                               ocSurfaceMap.w, ocLocalUv)) discard;
+        vec2 ocSample0 = texCoord + ocLocalUv * ocSurfaceMap.xy;
+        vec4 ocColor0 = texture(Sampler0, ocSample0);
+        if (transition > 0.0) {
+            vec2 ocSample1 = texCoord2 + ocLocalUv * ocSurfaceMap.xy;
+            color = mix(ocColor0, texture(Sampler0, ocSample1), transition);
+        } else {
+            color = ocColor0;
+        }
     } else {
         color = mix(sampleColor(texCoord), sampleColor(texCoord2), transition);
     }'''
@@ -529,7 +541,7 @@ def write_manifest(repo: Path) -> None:
         "upstream": "JagerMeistars/obj-cubed",
         "upstream_ref_tested": "6a85a1f30f5dd0843c656838c5ebca13f0e029ed",
         "automatic_backend": {
-            "static_non_equipment": "surface-v3",
+            "static_non_equipment": "surface-v3.1",
             "geometry_animation_equipment_or_rgb_geometry_scale": "full-v2-subgroup",
         },
         "shader_version": 410,
@@ -556,7 +568,7 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    print("Done. Blockbench usage is unchanged. Re-export static models to get surface-v3 PNGs.")
+    print("Done. Blockbench usage is unchanged. Re-export static models to get surface-v3.1 PNGs.")
     print("Geometry animation/equipment remains available on subgroup-capable backends (Vulkan on macOS).")
     return 0
 

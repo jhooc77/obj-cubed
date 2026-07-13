@@ -41,7 +41,7 @@ flat out int noshadow;
 
 #moj_import <objmc_tools.glsl>
 
-// OC_HYBRID_SURFACE_PATCH_v1_2
+// OC_HYBRID_SURFACE_PATCH_v1_3
 void main() {
     ocSurfaceCoord = vec2(0.0);
     ocSurfaceP01 = vec4(0.0);

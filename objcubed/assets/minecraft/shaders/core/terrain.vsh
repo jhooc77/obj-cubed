@@ -46,7 +46,7 @@ vec4 minecraft_sample_lightmap(sampler2D lightMap, ivec2 uv) {
     return texture(lightMap, clamp(uv / 256.0, vec2(0.5 / 16.0), vec2(15.5 / 16.0)));
 }
 
-// OC_HYBRID_SURFACE_PATCH_v1_2
+// OC_HYBRID_SURFACE_PATCH_v1_3
 void main() {
     ocSurfaceCoord = vec2(0.0);
     ocSurfaceP01 = vec4(0.0);

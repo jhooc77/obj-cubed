@@ -1,9 +1,9 @@
 {
-  "patch": "OC_HYBRID_SURFACE_PATCH_v1_2",
+  "patch": "OC_HYBRID_SURFACE_PATCH_v1_3",
   "upstream": "JagerMeistars/obj-cubed",
   "upstream_ref_tested": "6a85a1f30f5dd0843c656838c5ebca13f0e029ed",
   "automatic_backend": {
-    "static_non_equipment": "surface-v3",
+    "static_non_equipment": "surface-v3.1",
     "geometry_animation_equipment_or_rgb_geometry_scale": "full-v2-subgroup"
   },
   "shader_version": 410,

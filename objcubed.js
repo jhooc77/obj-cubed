@@ -2041,7 +2041,7 @@
         return { data, nfaces, faceGroups: firstObj.faceGroups, faceBlocks: firstObj.faceBlocks, uvClamped };
     }
 
-// OC_HYBRID_SURFACE_PATCH_v1_2
+// OC_HYBRID_SURFACE_PATCH_v1_3
     // Static OBJ backend: each Minecraft carrier rectangle is placed on the
     // actual OBJ face plane. Minecraft then applies its complete transform to
     // the real surface directly; no subgroup lane exchange or XYZ reconstruction

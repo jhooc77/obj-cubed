@@ -111,16 +111,22 @@ vec4 sampleColor(vec2 uv) {
 
 #moj_import <objmc_static_fragment.glsl>
 
-// OC_HYBRID_SURFACE_PATCH_v1_2
+// OC_HYBRID_SURFACE_PATCH_v1_3
 void main() {
     vec4 color;
     if (ocSurfaceMap.w > 0.5) {
         vec2 ocLocalUv;
         if (!ocResolveStaticUv(ocSurfaceCoord, ocSurfaceP01, ocSurfaceP23,
-                               ocSurfaceUV01, ocSurfaceUV23, ocSurfaceMap.z, ocLocalUv)) discard;
-        vec2 ocSample0 = texCoord  + ocLocalUv * ocSurfaceMap.xy;
-        vec2 ocSample1 = texCoord2 + ocLocalUv * ocSurfaceMap.xy;
-        color = mix(texture(Sampler0, ocSample0), texture(Sampler0, ocSample1), transition);
+                               ocSurfaceUV01, ocSurfaceUV23, ocSurfaceMap.z,
+                               ocSurfaceMap.w, ocLocalUv)) discard;
+        vec2 ocSample0 = texCoord + ocLocalUv * ocSurfaceMap.xy;
+        vec4 ocColor0 = texture(Sampler0, ocSample0);
+        if (transition > 0.0) {
+            vec2 ocSample1 = texCoord2 + ocLocalUv * ocSurfaceMap.xy;
+            color = mix(ocColor0, texture(Sampler0, ocSample1), transition);
+        } else {
+            color = ocColor0;
+        }
     } else {
         color = mix(sampleColor(texCoord), sampleColor(texCoord2), transition);
     }

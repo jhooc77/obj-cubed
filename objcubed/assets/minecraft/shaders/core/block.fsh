@@ -30,16 +30,22 @@ out vec4 fragColor;
 
 #moj_import <objmc_static_fragment.glsl>
 
-// OC_HYBRID_SURFACE_PATCH_v1_2
+// OC_HYBRID_SURFACE_PATCH_v1_3
 void main() {
     vec4 color;
     if (ocSurfaceMap.w > 0.5) {
         vec2 ocLocalUv;
         if (!ocResolveStaticUv(ocSurfaceCoord, ocSurfaceP01, ocSurfaceP23,
-                               ocSurfaceUV01, ocSurfaceUV23, ocSurfaceMap.z, ocLocalUv)) discard;
+                               ocSurfaceUV01, ocSurfaceUV23, ocSurfaceMap.z,
+                               ocSurfaceMap.w, ocLocalUv)) discard;
         vec2 ocSample0 = texCoord  + ocLocalUv * ocSurfaceMap.xy;
-        vec2 ocSample1 = texCoord2 + ocLocalUv * ocSurfaceMap.xy;
-        color = mix(texture(Sampler0, ocSample0), texture(Sampler0, ocSample1), transition);
+        vec4 ocColor0 = texture(Sampler0, ocSample0);
+        if (transition > 0.0) {
+            vec2 ocSample1 = texCoord2 + ocLocalUv * ocSurfaceMap.xy;
+            color = mix(ocColor0, texture(Sampler0, ocSample1), transition);
+        } else {
+            color = ocColor0;
+        }
     } else {
         color = isCustom == 1 ? mix(texelFetch(Sampler0, ivec2(texCoord * textureSize(Sampler0, 0)), 0), texelFetch(Sampler0, ivec2(texCoord2 * textureSize(Sampler0, 0)), 0), transition) : mix(texture(Sampler0, texCoord), texture(Sampler0, texCoord2), transition);
     }
