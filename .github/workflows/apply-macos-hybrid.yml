@@ -12,6 +12,10 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: macos-hybrid-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
@@ -34,33 +38,59 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Restore upstream generated sources
+      - name: Record branch source and restore reproducible inputs
         shell: bash
         run: |
           set -euo pipefail
+          echo "SOURCE_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           git cat-file -e 6a85a1f30f5dd0843c656838c5ebca13f0e029ed^{commit}
+          git cat-file -e 07a39c71cbb7da4df06ddb0ab45f28fc5675e1ca^{commit}
+          # Always regenerate the distributable source from the pinned upstream.
           git checkout 6a85a1f30f5dd0843c656838c5ebca13f0e029ed -- objcubed.js objcubed
           rm -f HYBRID_SURFACE_PATCH.json
-          rm -rf tools/macos-hybrid-perf-v4
+          # The base installer is deliberately restored to v1.2, upgraded to the
+          # proven v1.3 seam-safe backend, then compacted by surface-v1.4.
+          git checkout 07a39c71cbb7da4df06ddb0ab45f28fc5675e1ca -- \
+            tools/macos-hybrid/install.py \
+            tools/macos-hybrid/src \
+            tools/macos-hybrid/optimize_v13.py \
+            tools/macos-hybrid/validate_actual.py
 
-      - name: Upgrade tooling to v1.3
-        run: python3 tools/macos-hybrid/optimize_v13.py
+      - name: Generate seam-safe v1.3 base
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/macos-hybrid/optimize_v13.py
+          python3 tools/macos-hybrid/install.py .
 
-      - name: Apply backend to the real checkout
-        run: python3 tools/macos-hybrid/install.py .
+      - name: Apply compact surface-v1.4 performance backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/macos-hybrid/optimize_surface_v4.py .
+          # Restore the v1.4 validator from the source branch; optimize_v13 only
+          # needed its older copy while upgrading the base tooling.
+          git checkout "$SOURCE_HEAD" -- tools/macos-hybrid/validate_actual.py
+          # A second application must be a no-op apart from deterministic manifest writes.
+          python3 tools/macos-hybrid/optimize_surface_v4.py .
 
       - name: Remove installer backups
         run: find . -type f -name '*.pre-hybrid-surface' -delete
 
       - name: Validate generated JavaScript and hybrid structure
+        shell: bash
         run: |
+          set -euo pipefail
           node --check objcubed.js
           python3 tools/macos-hybrid/validate_actual.py
           python3 tools/macos-hybrid/tests/test_static_surface_math.py
           node tools/macos-hybrid/tests/test_surface_helper.mjs
+          node tools/macos-hybrid/tests/test_surface_v4_build.mjs
+          grep -q 'OC_STATIC_META_STRIDE = 10' objcubed.js
+          ! sed '/#if OC_HAS_SUBGROUP/,$d' objcubed/assets/minecraft/shaders/include/objmc_main.glsl | grep -Eq 'getvert\(|getpos\(|getuv\('
           grep -q 'ocBarycentricOwned' objcubed/assets/minecraft/shaders/include/objmc_static_fragment.glsl
           grep -q 'ocPackedFlags' objcubed/assets/minecraft/shaders/include/objmc_main.glsl
-          grep -q 'ocSurfaceMap.w, ocLocalUv' objcubed/assets/minecraft/shaders/core/item.fsh
+          grep -q 'vec4 ocColor0 = texture(Sampler0, ocSample0)' objcubed/assets/minecraft/shaders/core/item.fsh
 
       - name: Install upstream test dependencies
         run: npm install --ignore-scripts --force
@@ -106,7 +136,7 @@ jobs:
       - name: Upload patched repository ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: obj-cubed-macos-hybrid
+          name: obj-cubed-macos-hybrid-v1.4
           path: dist/*
           if-no-files-found: error
 
@@ -127,7 +157,7 @@ jobs:
             echo 'No generated changes to commit.'
             exit 0
           fi
-          git commit -m 'Fix NVIDIA seams and optimize static surface rendering'
+          git commit -m 'Optimize static rendering with compact surface-v1.4 metadata'
           git push origin HEAD:agent/macos-hybrid-compat
 
       - name: Enforce upstream test result
