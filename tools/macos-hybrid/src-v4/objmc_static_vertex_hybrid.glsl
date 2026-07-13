@@ -1,4 +1,4 @@
-// OC_HYBRID_SURFACE_PATCH_v1_3
+// OC_HYBRID_SURFACE_PATCH_v1_4
 // Static surface-v4 vertex path. Compact per-face metadata replaces the
 // position / UV / vertex-index streams used by surface-v3.
 bool ocStaticHandled = false;
@@ -34,7 +34,6 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
     ocStaticHandled = true;
     isCustom = 1;
 
-    // Only five compact header texels are needed by static-v4.
     ivec4 ocT1 = getmeta(ocTopLeft, 1);
     ivec4 ocT3 = getmeta(ocTopLeft, 3);
     ivec4 ocT5 = getmeta(ocTopLeft, 5);
@@ -86,25 +85,25 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
     if (!ocVisible) {
         Pos = vec3(9999.0);
     } else {
-        // Metadata is contiguous in the source sprite, not the stitched atlas;
-        // wrap using source width and then add the sprite top-left.
         int ocLocalLinear = (ocPixel.y - ocTopLeft.y) * ocSize.x
                           + (ocPixel.x - ocTopLeft.x);
-        ivec4 ocM[8];
-        for (int ocI = 0; ocI < 8; ocI++) {
+        ivec4 ocM[9];
+        for (int ocI = 0; ocI < 9; ocI++) {
             int ocL = ocLocalLinear + 1 + ocI;
             ivec2 ocMetaCoord = ocTopLeft + ivec2(ocL % ocSize.x, ocL / ocSize.x);
             ocM[ocI] = ivec4(texelFetch(Sampler0, ocMetaCoord, 0) * 255.0 + 0.5);
         }
 
-        vec2 ocQ0 = vec2(ocM[0].r * 256 + ocM[0].g, ocM[0].b * 256 + ocM[0].a) / 65535.0;
-        vec2 ocQ1 = vec2(ocM[1].r * 256 + ocM[1].g, ocM[1].b * 256 + ocM[1].a) / 65535.0;
-        vec2 ocQ2 = vec2(ocM[2].r * 256 + ocM[2].g, ocM[2].b * 256 + ocM[2].a) / 65535.0;
-        vec2 ocQ3 = vec2(ocM[3].r * 256 + ocM[3].g, ocM[3].b * 256 + ocM[3].a) / 65535.0;
-        vec2 ocUv0 = vec2(ocM[4].r * 256 + ocM[4].g, ocM[4].b * 256 + ocM[4].a) / 65535.0;
-        vec2 ocUv1 = vec2(ocM[5].r * 256 + ocM[5].g, ocM[5].b * 256 + ocM[5].a) / 65535.0;
-        vec2 ocUv2 = vec2(ocM[6].r * 256 + ocM[6].g, ocM[6].b * 256 + ocM[6].a) / 65535.0;
-        vec2 ocUv3 = vec2(ocM[7].r * 256 + ocM[7].g, ocM[7].b * 256 + ocM[7].a) / 65535.0;
+        int ocPackedFlags = ocM[0].r;
+        int ocVertexCount = clamp(ocM[0].g, 3, 4);
+        vec2 ocQ0 = vec2(ocM[1].r * 256 + ocM[1].g, ocM[1].b * 256 + ocM[1].a) / 65535.0;
+        vec2 ocQ1 = vec2(ocM[2].r * 256 + ocM[2].g, ocM[2].b * 256 + ocM[2].a) / 65535.0;
+        vec2 ocQ2 = vec2(ocM[3].r * 256 + ocM[3].g, ocM[3].b * 256 + ocM[3].a) / 65535.0;
+        vec2 ocQ3 = vec2(ocM[4].r * 256 + ocM[4].g, ocM[4].b * 256 + ocM[4].a) / 65535.0;
+        vec2 ocUv0 = vec2(ocM[5].r * 256 + ocM[5].g, ocM[5].b * 256 + ocM[5].a) / 65535.0;
+        vec2 ocUv1 = vec2(ocM[6].r * 256 + ocM[6].g, ocM[6].b * 256 + ocM[6].a) / 65535.0;
+        vec2 ocUv2 = vec2(ocM[7].r * 256 + ocM[7].g, ocM[7].b * 256 + ocM[7].a) / 65535.0;
+        vec2 ocUv3 = vec2(ocM[8].r * 256 + ocM[8].g, ocM[8].b * 256 + ocM[8].a) / 65535.0;
 
         ocSurfaceCoord = (ocCorner == 0) ? vec2(1.0, 1.0)
                        : (ocCorner == 1) ? vec2(1.0, 0.0)
@@ -114,8 +113,11 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
         ocSurfaceP23 = vec4(ocQ2, ocQ3);
         ocSurfaceUV01 = vec4(ocUv0, ocUv1);
         ocSurfaceUV23 = vec4(ocUv2, ocUv3);
-        bool ocTriangle = all(equal(ocM[2], ocM[3])) && all(equal(ocM[6], ocM[7]));
-        ocSurfaceMap = vec4(vec2(ocSize) / vec2(ocAtlasSize), ocTriangle ? 3.0 : 4.0, 1.0);
+        ocSurfaceMap = vec4(
+            vec2(ocSize) / vec2(ocAtlasSize),
+            float(ocVertexCount),
+            float(ocPackedFlags)
+        );
 
         float ocTexTime = GameTime * 24000.0;
 #ifdef ENTITY
@@ -161,5 +163,15 @@ if (ocMarker == ivec4(12, 34, 57, 255)) {
         }
         texCoord = ocBase0 / vec2(ocAtlasSize);
         texCoord2 = ocBase1 / vec2(ocAtlasSize);
+    }
+} else if (ocMarker == ivec4(12, 34, 56, 255)) {
+    // Stale surface-v3 carriers are incompatible with the compact layout.
+    // Consume them here on subgroup backends too, so they cannot fall through
+    // into full-v2 and get transformed twice. Re-export once with this plugin.
+    ivec4 ocOldStaticHeader = getmeta(ocTopLeft, 6);
+    if (ocOldStaticHeader.b == 3) {
+        ocStaticHandled = true;
+        isCustom = 1;
+        Pos = vec3(9999.0);
     }
 }
