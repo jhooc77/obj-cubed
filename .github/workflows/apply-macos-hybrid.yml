@@ -52,6 +52,20 @@ jobs:
             tools/macos-hybrid-payload \
             tools/macos-hybrid-payload.tar.gz.b64
 
+      - name: Apply surface-v4 performance patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if compgen -G 'tools/macos-hybrid-perf-v4/part-*.b64' > /dev/null; then
+            cat tools/macos-hybrid-perf-v4/part-*.b64 > /tmp/perf-v4.patch.gz.b64
+            base64 -d /tmp/perf-v4.patch.gz.b64 > /tmp/perf-v4.patch.gz
+            echo '1c7342d7142239bd15ee7b9b332b677b4f37fbf5edc1acdecfb76c0fb1b0affb  /tmp/perf-v4.patch.gz' | sha256sum -c -
+            gzip -dc /tmp/perf-v4.patch.gz | patch -p2
+            rm -rf tools/macos-hybrid-perf-v4 /tmp/perf-v4.patch.gz /tmp/perf-v4.patch.gz.b64
+          else
+            echo 'Surface-v4 performance patch is already materialized.'
+          fi
+
       - name: Apply backend to the real checkout
         run: python3 tools/macos-hybrid/install.py .
 
@@ -120,15 +134,17 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A -- \
+            README.md \
             objcubed.js \
             objcubed \
             HYBRID_SURFACE_PATCH.json \
-            tools/macos-hybrid
+            tools/macos-hybrid \
+            tools/macos-hybrid-perf-v4
           if git diff --cached --quiet; then
             echo 'No generated changes to commit.'
             exit 0
           fi
-          git commit -m 'Add macOS hybrid static-surface backend'
+          git commit -m 'Optimize static surface-v4 rendering'
           git push origin HEAD:agent/macos-hybrid-compat
 
       - name: Enforce upstream test result
