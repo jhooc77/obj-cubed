@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-TAG = "OC_HYBRID_SURFACE_PATCH_v1_3"
+TAG = "OC_HYBRID_SURFACE_PATCH_v1_4"
 
 
 def die(msg: str) -> None:
@@ -57,15 +57,24 @@ if len(plugin_text.splitlines()) < 5000:
 if len(main_text.splitlines()) < 800:
     die("objmc_main.glsl looks truncated")
 if TAG not in plugin_text or TAG not in main_text:
-    die("patch tag missing")
-if "OC_STATIC_META_STRIDE = 9" not in plugin_text:
+    die("surface-v1.4 patch tag missing")
+if "OC_STATIC_META_STRIDE = 10" not in plugin_text:
     die("surface-v4 compact metadata stride missing")
+if "cfg.staticSurface ? 0 : Math.ceil(data.positions.length * 3 / tw)" not in plugin_text:
+    die("static position stream was not removed")
+if "cfg.staticSurface ? 0 : Math.ceil(data.uvs.length * 2 / tw)" not in plugin_text:
+    die("static UV stream was not removed")
+if "cfg.staticSurface ? 0 : Math.ceil(data.vertices.length * 2 / tw)" not in plugin_text:
+    die("static index stream was not removed")
+
 prefix = main_text.split("#if OC_HAS_SUBGROUP", 1)[0]
 if "ivec4(12, 34, 57, 255)" not in prefix:
     die("surface-v4 marker missing")
 for forbidden in ("getvert(", "getpos(", "getuv("):
     if forbidden in prefix:
-        die(f"legacy data fetch remains in static-v4 path: {forbidden}")
+        die(f"legacy fetch remains in static-v4 path: {forbidden}")
+if "ocPackedFlags" not in prefix:
+    die("v1.3 deterministic edge-owner flags were not preserved")
 if "staticSurface: !(this.hasAnims" not in plugin_text:
     die("automatic static selection missing")
 if "!cbParts.includes('scale')" not in plugin_text:
@@ -107,7 +116,9 @@ if manifest.get("patch") != TAG:
     die("manifest patch version mismatch")
 if manifest.get("static_backend") != "surface-v4-compact-metadata":
     die("manifest static backend mismatch")
+if manifest.get("static_face_metadata_texels") != 10:
+    die("manifest metadata stride mismatch")
 if manifest.get("static_legacy_streams") is not False:
-    die("manifest says static legacy streams are still enabled")
+    die("manifest says static legacy streams remain enabled")
 
 print("actual checkout validation passed")
