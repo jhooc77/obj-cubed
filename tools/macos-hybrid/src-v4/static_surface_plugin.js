@@ -1,8 +1,8 @@
-// OC_HYBRID_SURFACE_PATCH_v1_3
+// OC_HYBRID_SURFACE_PATCH_v1_4
     // Static surface-v4: the carrier is the real face plane, while compact
     // face-local polygon + UV metadata replaces the legacy position/index
-    // streams. Each face uses 9 texels: pointer + 4 local points + 4 UVs.
-    const OC_STATIC_META_STRIDE = 9;
+    // streams. Each face uses 10 texels: pointer + flags + 4 local points + 4 UVs.
+    const OC_STATIC_META_STRIDE = 10;
 
     function buildStaticSurfaceElements(firstObj, data, cfg, tw, ty, headerRows, put, faceEmission) {
         const EPS = 1e-8;
@@ -81,7 +81,7 @@
             const U = norm(e10);
             const N = norm(cross(e10, e20));
             if (!U || !N) fallback(`face ${fi} is degenerate; triangulate or clean the OBJ`);
-            const V = norm(cross(U, N)); // U x V = -N, matching NORTH.
+            const V = norm(cross(U, N));
             if (!V) fallback(`face ${fi} has no stable plane basis`);
 
             if (count === 4) {
@@ -104,21 +104,37 @@
             const qm = [(qmin[0]+qmax[0])*0.5, (qmin[1]+qmax[1])*0.5];
             const center = add(p[0], add(mul(U,qm[0]), mul(V,qm[1])));
 
-            // Compact metadata may wrap across source-sprite rows. The shader
-            // addresses it relative to the sprite top-left and source width.
             const metaBase = headerRows * tw + fi * OC_STATIC_META_STRIDE;
             const px = metaBase % tw, py = Math.floor(metaBase / tw);
             put(px, py, Math.trunc(px/256)%256, px%256, Math.trunc(py/256)%256, py%256);
+
+            // Preserve the v1.3 deterministic edge-owner rule without carrying
+            // the legacy index stream. One compact flags texel is cheaper than
+            // re-fetching four position indices in every vertex invocation.
+            const posIds = [];
+            for (let k = 0; k < 4; k++) {
+                const vi = data.vertices[fi * 4 + k];
+                posIds.push(vi ? vi[0] : 0);
+            }
+            const owners0 = ((posIds[1] < posIds[2]) ? 1 : 0)
+                          | ((posIds[2] < posIds[0]) ? 2 : 0)
+                          | ((posIds[0] < posIds[1]) ? 4 : 0);
+            const owners1 = ((posIds[2] < posIds[3]) ? 1 : 0)
+                          | ((posIds[3] < posIds[0]) ? 2 : 0)
+                          | ((posIds[0] < posIds[2]) ? 4 : 0);
+            const packedFlags = 1 | (owners0 << 1) | (owners1 << 4);
+            putLinear(metaBase + 1, [packedFlags, count, 0, 255]);
+
             for (let k = 0; k < 4; k++) {
                 const [qxH,qxL] = enc01(qn[k][0]);
                 const [qyH,qyL] = enc01(qn[k][1]);
-                putLinear(metaBase + 1 + k, [qxH,qxL,qyH,qyL]);
+                putLinear(metaBase + 2 + k, [qxH,qxL,qyH,qyL]);
 
                 const vi = data.vertices[fi * 4 + k];
                 const sourceUv = vi && data.uvs[vi[1]] ? data.uvs[vi[1]] : [0,0];
                 const [uH,uL] = enc01(sourceUv[0]);
                 const [vH,vL] = enc01(sourceUv[1]);
-                putLinear(metaBase + 5 + k, [uH,uL,vH,vL]);
+                putLinear(metaBase + 6 + k, [uH,uL,vH,vL]);
             }
 
             const from = [(center[0]-w*0.5)*16, (center[1]-h*0.5)*16, center[2]*16];
