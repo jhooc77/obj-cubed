@@ -2041,13 +2041,13 @@
         return { data, nfaces, faceGroups: firstObj.faceGroups, faceBlocks: firstObj.faceBlocks, uvClamped };
     }
 
-// OC_HYBRID_SURFACE_PATCH_v1_3
-    // Static OBJ backend: each Minecraft carrier rectangle is placed on the
-    // actual OBJ face plane. Minecraft then applies its complete transform to
-    // the real surface directly; no subgroup lane exchange or XYZ reconstruction
-    // is required. Triangles / non-rectangular quads are clipped in the fragment
-    // shader using their original face-local polygon coordinates.
-    function buildStaticSurfaceElements(firstObj, cfg, tw, ty, headerRows, put, faceEmission) {
+// OC_HYBRID_SURFACE_PATCH_v1_4
+    // Static surface-v4: the carrier is the real face plane, while compact
+    // face-local polygon + UV metadata replaces the legacy position/index
+    // streams. Each face uses 10 texels: pointer + flags + 4 local points + 4 UVs.
+    const OC_STATIC_META_STRIDE = 10;
+
+    function buildStaticSurfaceElements(firstObj, data, cfg, tw, ty, headerRows, put, faceEmission) {
         const EPS = 1e-8;
         const MAX_PLANAR_ERROR = 2e-4;
         const RANGE_MIN = -16.0, RANGE_MAX = 32.0;
@@ -2057,7 +2057,6 @@
             e.ocStaticFallback = true;
             throw e;
         };
-
         const add = (a,b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
         const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
         const mul = (a,s) => [a[0]*s, a[1]*s, a[2]*s];
@@ -2071,12 +2070,17 @@
         const norm = a => { const l = len(a); return l > EPS ? mul(a, 1/l) : null; };
         const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
         const deg = r => r * 180 / Math.PI;
+        const enc01 = v => {
+            const u = Math.round(clamp(Number.isFinite(v) ? v : 0, 0, 1) * 65535);
+            return [(u >> 8) & 255, u & 255];
+        };
+        const putLinear = (linear, rgba) => put(
+            linear % tw, Math.floor(linear / tw), rgba[0], rgba[1], rgba[2], rgba[3]
+        );
 
-        // JOML rotationZYX(z,y,x) == Rz * Ry * Rx. Convert a proper rotation
-        // matrix (column vectors c0,c1,c2) back to the JSON Euler fields.
         function eulerXYZFromColumns(c0, c1, c2) {
             const r00=c0[0], r10=c0[1], r20=c0[2];
-            const r01=c1[0], r11=c1[1], r21=c1[2];
+            const r11=c1[1], r21=c1[2];
             const r12=c2[1], r22=c2[2];
             const y = Math.asin(clamp(-r20, -1, 1));
             const cy = Math.cos(y);
@@ -2085,7 +2089,6 @@
                 x = Math.atan2(r21, r22);
                 z = Math.atan2(r10, r00);
             } else {
-                // Gimbal lock: choose z=0 and absorb the remaining turn into x.
                 x = Math.atan2(-r12, r11);
                 z = 0;
             }
@@ -2093,8 +2096,7 @@
             return [clean(x), clean(y), clean(z)];
         }
 
-        // Current obj³ decoded model frame + its old carrier anchor c2:
-        // decoded=(p*S+offset-[0,.5,0]); anchor=[.5,.5,.5].
+        // Match the full-v2 decoded frame plus its old centre anchor.
         const modelPoint = p => [
             p[0] * cfg.scale + cfg.offset[0] + 0.5,
             p[1] * cfg.scale + cfg.offset[1],
@@ -2122,16 +2124,14 @@
             const U = norm(e10);
             const N = norm(cross(e10, e20));
             if (!U || !N) fallback(`face ${fi} is degenerate; triangulate or clean the OBJ`);
-            // U x V = -N, matching a NORTH JSON face whose local normal is -Z.
             const V = norm(cross(U, N));
             if (!V) fallback(`face ${fi} has no stable plane basis`);
 
             if (count === 4) {
                 const planeError = Math.abs(dot(sub(p[3], p[0]), N));
                 const faceScale = Math.max(len(e10), len(e20), len(sub(p[3], p[0])), 1);
-                if (planeError > Math.max(MAX_PLANAR_ERROR, faceScale * MAX_PLANAR_ERROR)) {
+                if (planeError > Math.max(MAX_PLANAR_ERROR, faceScale * MAX_PLANAR_ERROR))
                     fallback(`face ${fi} is non-planar (error ${planeError.toFixed(6)}); triangulate that quad`);
-                }
             }
 
             const q = p.map(P => {
@@ -2142,11 +2142,43 @@
             const qmax = [Math.max(...q.map(v=>v[0])), Math.max(...q.map(v=>v[1]))];
             const w = qmax[0]-qmin[0], h = qmax[1]-qmin[1];
             if (!(w > EPS && h > EPS)) fallback(`face ${fi} has a zero-size carrier`);
+            const qn = q.map(v => [(v[0]-qmin[0])/w, (v[1]-qmin[1])/h]);
 
             const qm = [(qmin[0]+qmax[0])*0.5, (qmin[1]+qmax[1])*0.5];
             const center = add(p[0], add(mul(U,qm[0]), mul(V,qm[1])));
-            const px = fi % tw, py = Math.floor(fi / tw) + headerRows;
+
+            const metaBase = headerRows * tw + fi * OC_STATIC_META_STRIDE;
+            const px = metaBase % tw, py = Math.floor(metaBase / tw);
             put(px, py, Math.trunc(px/256)%256, px%256, Math.trunc(py/256)%256, py%256);
+
+            // Preserve the v1.3 deterministic edge-owner rule without carrying
+            // the legacy index stream. One compact flags texel is cheaper than
+            // re-fetching four position indices in every vertex invocation.
+            const posIds = [];
+            for (let k = 0; k < 4; k++) {
+                const vi = data.vertices[fi * 4 + k];
+                posIds.push(vi ? vi[0] : 0);
+            }
+            const owners0 = ((posIds[1] < posIds[2]) ? 1 : 0)
+                          | ((posIds[2] < posIds[0]) ? 2 : 0)
+                          | ((posIds[0] < posIds[1]) ? 4 : 0);
+            const owners1 = ((posIds[2] < posIds[3]) ? 1 : 0)
+                          | ((posIds[3] < posIds[0]) ? 2 : 0)
+                          | ((posIds[0] < posIds[2]) ? 4 : 0);
+            const packedFlags = 1 | (owners0 << 1) | (owners1 << 4);
+            putLinear(metaBase + 1, [packedFlags, count, 0, 255]);
+
+            for (let k = 0; k < 4; k++) {
+                const [qxH,qxL] = enc01(qn[k][0]);
+                const [qyH,qyL] = enc01(qn[k][1]);
+                putLinear(metaBase + 2 + k, [qxH,qxL,qyH,qyL]);
+
+                const vi = data.vertices[fi * 4 + k];
+                const sourceUv = vi && data.uvs[vi[1]] ? data.uvs[vi[1]] : [0,0];
+                const [uH,uL] = enc01(sourceUv[0]);
+                const [vH,vL] = enc01(sourceUv[1]);
+                putLinear(metaBase + 6 + k, [uH,uL,vH,vL]);
+            }
 
             const from = [(center[0]-w*0.5)*16, (center[1]-h*0.5)*16, center[2]*16];
             const to   = [(center[0]+w*0.5)*16, (center[1]+h*0.5)*16, center[2]*16];
@@ -2154,8 +2186,6 @@
             const rot = eulerXYZFromColumns(U, V, mul(N,-1));
             const elem = {
                 from, to,
-                // Always emit a rotation object, including [0,0,0]. FaceBakery
-                // then preserves the original c0..c3 order instead of re-winding.
                 rotation: { origin, x: rot[0], y: rot[1], z: rot[2], rescale: false },
                 faces: { north: {
                     uv: [(px+0.1)*16/tw, (py+0.1)*16/ty,
@@ -2171,11 +2201,6 @@
             }
         }
 
-        // Cuboid JSON validates from/to against [-16,32].  Do not hide a
-        // compensating translation in the 26.2 item wrapper: that wrapper does
-        // not exist for placed blocks.  When a surface cannot fit exactly, fall
-        // back to the original full carrier backend so item/block behaviour
-        // remains identical instead of silently diverging.
         for (let a=0; a<3; a++) {
             if (bmin[a] < RANGE_MIN - 1e-4 || bmax[a] > RANGE_MAX + 1e-4) {
                 fallback(
@@ -2930,11 +2955,13 @@
         if (nfaces === 0) throw new Error('No faces found in OBJ');
         const nvertices = nfaces * 4;
 
-        const uvH  = Math.ceil(nfaces / tw);
+        // Surface-v4 stores compact face metadata only. Full-v2 keeps
+        // the original position / UV / vertex-index streams byte-for-byte.
+        const uvH  = Math.ceil((cfg.staticSurface ? nfaces * OC_STATIC_META_STRIDE : nfaces) / tw);
         const texH = th;
-        const vpH  = Math.ceil(data.positions.length * 3 / tw);
-        const vtH  = Math.ceil(data.uvs.length * 2 / tw);
-        const vH   = Math.ceil(data.vertices.length * 2 / tw); // includes all frames
+        const vpH  = cfg.staticSurface ? 0 : Math.ceil(data.positions.length * 3 / tw);
+        const vtH  = cfg.staticSurface ? 0 : Math.ceil(data.uvs.length * 2 / tw);
+        const vH   = cfg.staticSurface ? 0 : Math.ceil(data.vertices.length * 2 / tw); // includes all frames
 
         // --- Encoder safety guards: fail loudly instead of silently corrupting the PNG ---
         const BYTE24_MAX = 16777215; // u24() holds 0..2^24-1; larger values wrap mod 2^24
@@ -3042,7 +3069,7 @@
 
         // Row 0 — header. marker.a=255 (alpha=255 prevents GUI alpha-premultiplication
         // from corrupting RGB; legacy marker.a=78 broke GUI rendering for this reason).
-        put(0, 0, 12, 34, 56, 255);
+        put(0, 0, 12, 34, cfg.staticSurface ? 57 : 56, 255);
         put(1, 0, Math.trunc(tw/256), tw%256, Math.trunc(frameH/256), 255);
         put(2, 0, Math.trunc(nvertices/16777216)%256, Math.trunc(nvertices/65536)%256,
                   Math.trunc(nvertices/256)%256, 255);
@@ -3050,7 +3077,8 @@
                   nframes%256, ntextures);
         put(4, 0, Math.trunc(dur/65536)%256, Math.trunc(dur/256)%256, dur%256,
                   128|(cfg.autoplay?64:0)|(cfg.easing<<4)|(cfg.interpolation<<2));
-        put(5, 0, Math.trunc(vpH/256)%256, vpH%256, Math.trunc(vtH/256)%256, 255);
+        put(5, 0, Math.trunc((cfg.staticSurface ? uvH : vpH)/256)%256,
+                  (cfg.staticSurface ? uvH : vpH)%256, Math.trunc(vtH/256)%256, 255);
         // t[6].r bits: 7=noshadow, 6..5=autorotate, 4..2=visibility,
         //   1=hasStaticDisplay (step A1 gate), 0=colorbehavior high bit.
         // t[6].b = GUI header version (display-1:1 step B): 2 = q16 GUI layout in
@@ -3058,8 +3086,8 @@
         // encoder wrote 255 here) cannot desync from the q16 decode. A stays 255.
         put(6, 0,
             ((cfg.noshadow?1:0)<<7)|(cfg.autorotate<<5)|(cfg.visibility<<2)|((staticDisplay?1:0)<<1)|Math.trunc(cb/256),
-            cb%256, cfg.staticSurface ? 3 : 2, 255);
-        put(7, 0, frameH%256, nvertices%256, vtH%256, 255);
+            cb%256, cfg.staticSurface ? 4 : 2, 255);
+        put(7, 0, frameH%256, nvertices%256, cfg.staticSurface ? 0 : vtH%256, 255);
         // GUI shader meta at q16 (display-1:1 step B): 8 pixels, 2 bytes/axis
         // (high,low) for scale/trans/rot/pivot. All A=255 for premultiplication
         // safety. Layout MUST match the shader decode (objmc_main.glsl GUI block):
@@ -3094,7 +3122,9 @@
         //   x=6+2i, 7+2i     — atlas band i: (y0H, y0L, fHH) / (fHL, frames, -)
         //   x=6+2B + (id-5)  — dynamic entries for ids 5..8 (B = band count)
         // Capacity is bounded by the texture width; bands are trimmed to fit.
-        const { dynamics } = assignSlotMarkers(buildDisplayTransforms(cfg));
+        const { dynamics } = cfg.staticSurface
+            ? { dynamics: [] }
+            : assignSlotMarkers(buildDisplayTransforms(cfg));
         const extraDyn = Math.max(0, dynamics.length - 4);
         const maxBands = Math.min(15, Math.floor((tw - 6 - extraDyn) / 2));
         if (atlasBands.length > maxBands) {
@@ -3133,7 +3163,7 @@
         let staticSurfaceMeta = null;
         if (cfg.staticSurface) {
             staticSurfaceMeta = buildStaticSurfaceElements(
-                staticFirstObj, cfg, tw, ty, headerRows, put, faceEmission
+                staticFirstObj, data, cfg, tw, ty, headerRows, put, faceEmission
             );
             elements.push(...staticSurfaceMeta.elements);
         } else {
@@ -3195,6 +3225,9 @@
             }
         }
 
+        if (cfg.staticSurface && (uvClamped || data.uvs.some(uv => uv.some(v => v < -1e-6 || v > 1 + 1e-6))))
+            surfaceWarning('some UVs fall outside the 0..1 frame (tiling/negative) and were clamped — those faces may look wrong. Keep the model UV-mapped inside the texture frame.');
+
         // Position data
         let ybase = headerRows+uvH+texH;
         // VERTICAL ORIGIN CONVENTION: the decoded frame is BLOCK-CENTRE relative
@@ -3213,6 +3246,7 @@
         // the SAME decoded model frame (before its part re-anchoring/rotation),
         // so armor on entities is byte-equivalent to the pre-convention state.
         const bakeOffset = [cfg.offset[0], cfg.offset[1] - 0.5, cfg.offset[2]];
+        if (!cfg.staticSurface) {
         for (let i = 0; i < data.positions.length; i++) {
             for (const [j, pxArr] of posPixels(data.positions[i], cfg.scale, bakeOffset).entries()) {
                 const p = i*3+j;
@@ -3240,6 +3274,7 @@
                 put(p%tw, ybase+Math.floor(p/tw), ...pxArr);
             }
         }
+        }
 
         // Round-trip verification: decode a few entries from the buffer
         // using the same logic the shader uses, and compare with source data.
@@ -3256,7 +3291,7 @@
                 'uvStart[0]=', rd(0,headerRows), 'posStart[0]=', rd(0,headerRows+uvH+texH));
             // Verify marker
             const mk = rd(0, 0);
-            if (mk[0]!==12||mk[1]!==34||mk[2]!==56||mk[3]!==255) {
+            if (mk[0]!==12||mk[1]!==34||mk[2]!==(cfg.staticSurface?57:56)||mk[3]!==255) {
                 verifyWarns.push('marker mismatch');
                 console.error('[obj3-verify] MARKER MISMATCH:', mk);
             }
@@ -3267,6 +3302,15 @@
             const decNf = Math.max(h3[0]*65536+h3[1]*256+h3[2], 1);
             if (decNv !== nvertices) { verifyWarns.push('nvertices mismatch'); console.error(`[obj3-verify] nvertices: encoded=${decNv} expected=${nvertices}`); }
             if (decNf !== nframes)   { verifyWarns.push('nframes mismatch');   console.error(`[obj3-verify] nframes: encoded=${decNf} expected=${nframes}`); }
+            if (cfg.staticSurface) {
+                const m0 = rd(0, headerRows);
+                const mx = m0[0] * 256 + m0[1];
+                const my = m0[2] * 256 + m0[3];
+                if (mx !== 0 || my !== headerRows) {
+                    verifyWarns.push('static metadata pointer mismatch');
+                    console.error(`[obj3-verify] static pointer: enc=[${mx},${my}] expected=[0,${headerRows}]`);
+                }
+            } else {
             // Verify first position (shader decodes as v*scale+offset)
             const posBase = headerRows + uvH + texH;
             const px0 = rd(0, posBase), px1 = rd(1, posBase), px2 = rd(2, posBase);
@@ -3318,6 +3362,7 @@
                     if (decLPi !== srcLast[0]) { verifyWarns.push('last frame mismatch'); console.error(`[obj3-verify] vert[${lastIdx}].pos: enc=${decLPi} exp=${srcLast[0]}`); }
                 }
             }
+            }
         } catch(e) { verifyWarns.push('verify error'); console.error('[obj3-verify] error:', e.message); }
 
         // Block a corrupt export: any hard integrity mismatch (marker / counts /
@@ -3333,7 +3378,7 @@
         const warnStr = verifyWarns.length
             ? t('warn_suffix').replace('{n}', verifyWarns.length).replace('{w}', tPlural(verifyWarns.length, 'warnings'))
             : '';
-        const debugInfo = `${nfaces} ${tPlural(nfaces, 'faces')} · ${nframes} ${tPlural(nframes, 'frames')} · ${tw}×${ty}px` + (cfg.staticSurface ? ' · surface-v3' : ' · full-v2') + warnStr;
+        const debugInfo = `${nfaces} ${tPlural(nfaces, 'faces')} · ${nframes} ${tPlural(nframes, 'frames')} · ${tw}×${ty}px` + (cfg.staticSurface ? ' · surface-v4' : ' · full-v2') + warnStr;
 
         return { pngBuffer, rawBuf: buf, elements, nfaces, nvertices, nframes, tw, ty, debugInfo, faceGroups, faceBlocks, faceToPart, faceEmission,
             staticSurface: !!cfg.staticSurface,

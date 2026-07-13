@@ -42,7 +42,7 @@ out vec4 fragColor;
 
 #moj_import <objmc_static_fragment.glsl>
 
-// OC_HYBRID_SURFACE_PATCH_v1_3
+// OC_HYBRID_SURFACE_PATCH_v1_4
 void main() {
     // objmc debug bypass (isCustom == 2 flag set in vertex shader)
     if (isCustom == 2) {

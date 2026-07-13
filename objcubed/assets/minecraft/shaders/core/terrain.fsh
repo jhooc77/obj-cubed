@@ -111,7 +111,7 @@ vec4 sampleColor(vec2 uv) {
 
 #moj_import <objmc_static_fragment.glsl>
 
-// OC_HYBRID_SURFACE_PATCH_v1_3
+// OC_HYBRID_SURFACE_PATCH_v1_4
 void main() {
     vec4 color;
     if (ocSurfaceMap.w > 0.5) {
@@ -128,7 +128,7 @@ void main() {
             color = ocColor0;
         }
     } else {
-        color = mix(sampleColor(texCoord), sampleColor(texCoord2), transition);
+        color = transition > 0.0 ? mix(sampleColor(texCoord), sampleColor(texCoord2), transition) : sampleColor(texCoord);
     }
 
     //custom lighting

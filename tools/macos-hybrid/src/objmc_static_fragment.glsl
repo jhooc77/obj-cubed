@@ -1,32 +1,26 @@
-// obj³ static-surface fragment helpers — v1.3.
-// Resolves a point on the rectangular carrier back into the source OBJ face.
-//
-// NVIDIA seam fix:
-// v1.2 expanded every triangle by a fixed epsilon. Adjacent coplanar carriers
-// therefore overlapped along every mesh edge and some drivers resolved the
-// equal-depth fragments as a dotted/wireframe-looking z-fight. v1.3 only lets
-// one deterministic owner expand across a slightly-negative edge. Accepted
-// weights are clamped back onto the polygon before UV reconstruction.
-
+// obj³ static-surface fragment helpers (surface-v4 compact metadata).
 float ocCross2(vec2 a, vec2 b) {
     return a.x * b.y - a.y * b.x;
 }
 
 bool ocBarycentricOwned(vec2 p, vec2 a, vec2 b, vec2 c, int ownerBits, out vec3 w) {
-    float den = ocCross2(b - a, c - a);
+    vec2 e0 = b - a;
+    vec2 e1 = c - a;
+    float den = ocCross2(e0, e1);
     if (abs(den) < 1.0e-10) {
         w = vec3(0.0);
         return false;
     }
 
+    float invDen = 1.0 / den;
+    vec2 d = p - a;
     vec3 raw;
-    raw.x = ocCross2(b - p, c - p) / den;
-    raw.y = ocCross2(c - p, a - p) / den;
-    raw.z = 1.0 - raw.x - raw.y;
+    raw.y = ocCross2(d, e1) * invDen;
+    raw.z = ocCross2(e0, d) * invDen;
+    raw.x = 1.0 - raw.y - raw.z;
 
-    // Roughly half a fragment footprint. A value farther outside is definitely
-    // not covered. Inside the tiny uncertainty band only the edge owner may
-    // extend, avoiding both cracks and coplanar overlap/z-fighting.
+    // Only one deterministic owner may fill a sub-pixel edge uncertainty band.
+    // This avoids both cracks and the coplanar overlap/z-fight seen on NVIDIA.
     vec3 tol = max(fwidth(raw) * 0.55, vec3(1.0e-7));
     if (any(lessThan(raw, -tol))) {
         w = vec3(0.0);
@@ -36,8 +30,6 @@ bool ocBarycentricOwned(vec2 p, vec2 a, vec2 b, vec2 c, int ownerBits, out vec3 
     if (raw.y < 0.0 && (ownerBits & 2) == 0) return false;
     if (raw.z < 0.0 && (ownerBits & 4) == 0) return false;
 
-    // Never extrapolate UVs outside the source polygon. Besides avoiding atlas
-    // bleed this also makes the owner overlap visually identical to the edge.
     w = max(raw, vec3(0.0));
     float sumW = w.x + w.y + w.z;
     if (sumW <= 1.0e-12) {
@@ -66,9 +58,6 @@ bool ocResolveStaticUv(
     vec2 uv1 = uv01.zw;
     vec2 uv2 = uv23.xy;
     vec2 uv3 = uv23.zw;
-
-    // bit 0 = active; bits 1..3 = triangle 0 edge owners;
-    // bits 4..6 = triangle 1 edge owners.
     int flags = int(floor(packedFlags + 0.5));
     int owners0 = (flags >> 1) & 7;
     int owners1 = (flags >> 4) & 7;

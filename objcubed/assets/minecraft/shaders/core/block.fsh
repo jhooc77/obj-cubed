@@ -30,7 +30,7 @@ out vec4 fragColor;
 
 #moj_import <objmc_static_fragment.glsl>
 
-// OC_HYBRID_SURFACE_PATCH_v1_3
+// OC_HYBRID_SURFACE_PATCH_v1_4
 void main() {
     vec4 color;
     if (ocSurfaceMap.w > 0.5) {
