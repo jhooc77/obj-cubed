@@ -2041,6 +2041,152 @@
         return { data, nfaces, faceGroups: firstObj.faceGroups, faceBlocks: firstObj.faceBlocks, uvClamped };
     }
 
+// OC_HYBRID_SURFACE_PATCH_v1_2
+    // Static OBJ backend: each Minecraft carrier rectangle is placed on the
+    // actual OBJ face plane. Minecraft then applies its complete transform to
+    // the real surface directly; no subgroup lane exchange or XYZ reconstruction
+    // is required. Triangles / non-rectangular quads are clipped in the fragment
+    // shader using their original face-local polygon coordinates.
+    function buildStaticSurfaceElements(firstObj, cfg, tw, ty, headerRows, put, faceEmission) {
+        const EPS = 1e-8;
+        const MAX_PLANAR_ERROR = 2e-4;
+        const RANGE_MIN = -16.0, RANGE_MAX = 32.0;
+
+        const fallback = message => {
+            const e = new Error('OC_STATIC_FALLBACK: ' + message);
+            e.ocStaticFallback = true;
+            throw e;
+        };
+
+        const add = (a,b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+        const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+        const mul = (a,s) => [a[0]*s, a[1]*s, a[2]*s];
+        const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+        const cross = (a,b) => [
+            a[1]*b[2]-a[2]*b[1],
+            a[2]*b[0]-a[0]*b[2],
+            a[0]*b[1]-a[1]*b[0],
+        ];
+        const len = a => Math.hypot(a[0], a[1], a[2]);
+        const norm = a => { const l = len(a); return l > EPS ? mul(a, 1/l) : null; };
+        const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+        const deg = r => r * 180 / Math.PI;
+
+        // JOML rotationZYX(z,y,x) == Rz * Ry * Rx. Convert a proper rotation
+        // matrix (column vectors c0,c1,c2) back to the JSON Euler fields.
+        function eulerXYZFromColumns(c0, c1, c2) {
+            const r00=c0[0], r10=c0[1], r20=c0[2];
+            const r01=c1[0], r11=c1[1], r21=c1[2];
+            const r12=c2[1], r22=c2[2];
+            const y = Math.asin(clamp(-r20, -1, 1));
+            const cy = Math.cos(y);
+            let x, z;
+            if (Math.abs(cy) > 1e-6) {
+                x = Math.atan2(r21, r22);
+                z = Math.atan2(r10, r00);
+            } else {
+                // Gimbal lock: choose z=0 and absorb the remaining turn into x.
+                x = Math.atan2(-r12, r11);
+                z = 0;
+            }
+            const clean = v => Math.abs(v) < 1e-7 ? 0 : deg(v);
+            return [clean(x), clean(y), clean(z)];
+        }
+
+        // Current obj³ decoded model frame + its old carrier anchor c2:
+        // decoded=(p*S+offset-[0,.5,0]); anchor=[.5,.5,.5].
+        const modelPoint = p => [
+            p[0] * cfg.scale + cfg.offset[0] + 0.5,
+            p[1] * cfg.scale + cfg.offset[1],
+            p[2] * cfg.scale + cfg.offset[2] + 0.5,
+        ];
+
+        const raw = [];
+        const bmin = [ Infinity, Infinity, Infinity ];
+        const bmax = [-Infinity,-Infinity,-Infinity ];
+
+        for (let fi = 0; fi < firstObj.faces.length; fi++) {
+            const face = firstObj.faces[fi];
+            const count = Math.min(4, face.length);
+            if (count < 3) fallback(`face ${fi} has fewer than 3 vertices`);
+            const p = [];
+            for (let k = 0; k < count; k++) {
+                const src = firstObj.positions[face[k][0]];
+                if (!src) fallback(`face ${fi} references a missing position`);
+                p.push(modelPoint(src));
+            }
+            if (count === 3) p.push(p[2]);
+
+            const e10 = sub(p[1], p[0]);
+            const e20 = sub(p[2], p[0]);
+            const U = norm(e10);
+            const N = norm(cross(e10, e20));
+            if (!U || !N) fallback(`face ${fi} is degenerate; triangulate or clean the OBJ`);
+            // U x V = -N, matching a NORTH JSON face whose local normal is -Z.
+            const V = norm(cross(U, N));
+            if (!V) fallback(`face ${fi} has no stable plane basis`);
+
+            if (count === 4) {
+                const planeError = Math.abs(dot(sub(p[3], p[0]), N));
+                const faceScale = Math.max(len(e10), len(e20), len(sub(p[3], p[0])), 1);
+                if (planeError > Math.max(MAX_PLANAR_ERROR, faceScale * MAX_PLANAR_ERROR)) {
+                    fallback(`face ${fi} is non-planar (error ${planeError.toFixed(6)}); triangulate that quad`);
+                }
+            }
+
+            const q = p.map(P => {
+                const d = sub(P, p[0]);
+                return [dot(d,U), dot(d,V)];
+            });
+            const qmin = [Math.min(...q.map(v=>v[0])), Math.min(...q.map(v=>v[1]))];
+            const qmax = [Math.max(...q.map(v=>v[0])), Math.max(...q.map(v=>v[1]))];
+            const w = qmax[0]-qmin[0], h = qmax[1]-qmin[1];
+            if (!(w > EPS && h > EPS)) fallback(`face ${fi} has a zero-size carrier`);
+
+            const qm = [(qmin[0]+qmax[0])*0.5, (qmin[1]+qmax[1])*0.5];
+            const center = add(p[0], add(mul(U,qm[0]), mul(V,qm[1])));
+            const px = fi % tw, py = Math.floor(fi / tw) + headerRows;
+            put(px, py, Math.trunc(px/256)%256, px%256, Math.trunc(py/256)%256, py%256);
+
+            const from = [(center[0]-w*0.5)*16, (center[1]-h*0.5)*16, center[2]*16];
+            const to   = [(center[0]+w*0.5)*16, (center[1]+h*0.5)*16, center[2]*16];
+            const origin = center.map(v => v*16);
+            const rot = eulerXYZFromColumns(U, V, mul(N,-1));
+            const elem = {
+                from, to,
+                // Always emit a rotation object, including [0,0,0]. FaceBakery
+                // then preserves the original c0..c3 order instead of re-winding.
+                rotation: { origin, x: rot[0], y: rot[1], z: rot[2], rescale: false },
+                faces: { north: {
+                    uv: [(px+0.1)*16/tw, (py+0.1)*16/ty,
+                         (px+0.9)*16/tw, (py+0.9)*16/ty],
+                    texture: '#0', tintindex: 0,
+                }},
+            };
+            if (faceEmission[fi] > 0) elem.light_emission = faceEmission[fi];
+            raw.push(elem);
+            for (let a=0;a<3;a++) {
+                bmin[a] = Math.min(bmin[a], from[a], to[a]);
+                bmax[a] = Math.max(bmax[a], from[a], to[a]);
+            }
+        }
+
+        // Cuboid JSON validates from/to against [-16,32].  Do not hide a
+        // compensating translation in the 26.2 item wrapper: that wrapper does
+        // not exist for placed blocks.  When a surface cannot fit exactly, fall
+        // back to the original full carrier backend so item/block behaviour
+        // remains identical instead of silently diverging.
+        for (let a=0; a<3; a++) {
+            if (bmin[a] < RANGE_MIN - 1e-4 || bmax[a] > RANGE_MAX + 1e-4) {
+                fallback(
+                    `carriers exceed Minecraft's [-16,32] element range on ${'XYZ'[a]} ` +
+                    `(min ${(bmin[a]/16).toFixed(3)}, max ${(bmax[a]/16).toFixed(3)} blocks)`
+                );
+            }
+        }
+        return { elements: raw, modelTransformation: null };
+    }
+
     // =========================================================
     // Section 6: Pixel Encoding
     // =========================================================
@@ -2603,7 +2749,7 @@
             // GUI: handled entirely by shader header (cfg.displaySlots.gui →
             // texture meta pixels t[8..12]). Model.json display.gui must stay
             // identity, otherwise MC applies the tag on top of shader transform.
-            if (key === 'gui') continue;
+            if (key === 'gui' && !cfg.staticSurface) continue;
             // Hands: per-slot model.json owns rotation/translation AND scale now.
             // Vanilla applies display.firstperson_* verbatim (step A2 revert);
             // the shader no longer packs/applies a hand scale.
@@ -2639,6 +2785,11 @@
             throw new Error('No OBJ content');
 
         const nframes   = objContents.length;
+        if (cfg.staticSurface && nframes !== 1)
+            throw new Error('Static surface export requires one geometry frame.');
+        if (cfg.staticSurface && cfg.exportAsEquipment)
+            throw new Error('Equipment automatically uses the full carrier backend.');
+        const staticFirstObj = cfg.staticSurface ? parseObj(objContents[0], 0) : null;
 
         // Determine texture(s): atlas if multiple textures referenced, else single
         let texData; // { data, width, height }
@@ -2907,7 +3058,7 @@
         // encoder wrote 255 here) cannot desync from the q16 decode. A stays 255.
         put(6, 0,
             ((cfg.noshadow?1:0)<<7)|(cfg.autorotate<<5)|(cfg.visibility<<2)|((staticDisplay?1:0)<<1)|Math.trunc(cb/256),
-            cb%256, 2, 255);
+            cb%256, cfg.staticSurface ? 3 : 2, 255);
         put(7, 0, frameH%256, nvertices%256, vtH%256, 255);
         // GUI shader meta at q16 (display-1:1 step B): 8 pixels, 2 bytes/axis
         // (high,low) for scale/trans/rot/pivot. All A=255 for premultiplication
@@ -2979,24 +3130,26 @@
 
         // UV header + JSON elements
         const elements = [];
-        for (let i = 0; i < nfaces; i++) {
-            const px = i%tw, py = Math.floor(i/tw)+headerRows;
-            put(px, py, Math.trunc(px/256)%256, px%256, Math.trunc(py/256)%256, py%256);
-            const elem = {
-                // Carrier anchor = FaceBakery NORTH c2 = MIN corner = (8,8,8) px = block
-                // centre (0.5,0.5,0.5). The shader anchors the centred decoded model AT c2,
-                // so c2 must be the cube CENTRE, not the cube bottom. Was [8,0,8] (MIN_Y=0 =
-                // bottom) which dropped every model 0.5 block (8px) low — verified by
-                // tools/render-tester (IoU 0.47 -> 0.998 after this shift). +Y edge stays
-                // 16px (8..24) so display scale/rotation reconstruction is unchanged.
-                from: [8,8,8], to: [24,24,8],
-                faces: { north: {
-                    uv: [(px+0.1)*16/tw,(py+0.1)*16/ty,(px+0.9)*16/tw,(py+0.9)*16/ty],
-                    texture: '#0', tintindex: 0,
-                }},
-            };
-            if (faceEmission[i] > 0) elem.light_emission = faceEmission[i];
-            elements.push(elem);
+        let staticSurfaceMeta = null;
+        if (cfg.staticSurface) {
+            staticSurfaceMeta = buildStaticSurfaceElements(
+                staticFirstObj, cfg, tw, ty, headerRows, put, faceEmission
+            );
+            elements.push(...staticSurfaceMeta.elements);
+        } else {
+            for (let i = 0; i < nfaces; i++) {
+                const px = i%tw, py = Math.floor(i/tw)+headerRows;
+                put(px, py, Math.trunc(px/256)%256, px%256, Math.trunc(py/256)%256, py%256);
+                const elem = {
+                    from: [8,8,8], to: [24,24,8],
+                    faces: { north: {
+                        uv: [(px+0.1)*16/tw,(py+0.1)*16/ty,(px+0.9)*16/tw,(py+0.9)*16/ty],
+                        texture: '#0', tintindex: 0,
+                    }},
+                };
+                if (faceEmission[i] > 0) elem.light_emission = faceEmission[i];
+                elements.push(elem);
+            }
         }
 
         // Texture rows
@@ -3180,9 +3333,11 @@
         const warnStr = verifyWarns.length
             ? t('warn_suffix').replace('{n}', verifyWarns.length).replace('{w}', tPlural(verifyWarns.length, 'warnings'))
             : '';
-        const debugInfo = `${nfaces} ${tPlural(nfaces, 'faces')} · ${nframes} ${tPlural(nframes, 'frames')} · ${tw}×${ty}px` + warnStr;
+        const debugInfo = `${nfaces} ${tPlural(nfaces, 'faces')} · ${nframes} ${tPlural(nframes, 'frames')} · ${tw}×${ty}px` + (cfg.staticSurface ? ' · surface-v3' : ' · full-v2') + warnStr;
 
-        return { pngBuffer, rawBuf: buf, elements, nfaces, nvertices, nframes, tw, ty, debugInfo, faceGroups, faceBlocks, faceToPart, faceEmission };
+        return { pngBuffer, rawBuf: buf, elements, nfaces, nvertices, nframes, tw, ty, debugInfo, faceGroups, faceBlocks, faceToPart, faceEmission,
+            staticSurface: !!cfg.staticSurface,
+            staticModelTransformation: staticSurfaceMeta ? staticSurfaceMeta.modelTransformation : null };
     }
 
     // =========================================================
@@ -3268,7 +3423,17 @@
         const { objs, mtl } = await getObjContents(cfg, (i, n) =>
             onStatus(t('status_baking').replace('{i}', i).replace('{n}', n))
         );
-        const result = await buildOutput(cfg, objs, mtl);
+        let result;
+        try {
+            result = await buildOutput(cfg, objs, mtl);
+        } catch (e) {
+            if (!(cfg.staticSurface && e && e.ocStaticFallback)) throw e;
+            console.warn('[obj³] static surface fallback:', e.message);
+            surfaceWarning(e.message.replace(/^OC_STATIC_FALLBACK:\s*/, '') +
+                ' — exported through the original full carrier backend.');
+            cfg = { ...cfg, staticSurface: false };
+            result = await buildOutput(cfg, objs, mtl);
+        }
         onStatus(t('status_choose_location').replace('{info}', result.debugInfo));
         await saveSingleOutput(result, displayTransforms, cfg);
         onStatus(t('export_done').replace('{info}', result.debugInfo));
@@ -3331,7 +3496,10 @@
     // 0.65-midpoint rule in the shader.
     const SLOT_MARKER = { NEUTRAL: 0, DYN_MIN: 1, DYN_MAX: 8 };
     const slotMarkerMid = (id) => 0.5 + id * 0.035;
-    function calibratedElementsForSlot(baseElements, slot, markerId) {
+    function calibratedElementsForSlot(baseElements, slot, markerId, staticSurface) {
+        // Surface carriers are the real model geometry. Legacy anchor and
+        // UV marker calibration applies only to flat carriers.
+        if (staticSurface) return baseElements;
         const off = SLOT_OFFSETS[slot] || { x: 0, y: 0, z: 0 };
         const id = markerId || 0;
         if (off.x === 0 && off.y === 0 && off.z === 0 && id === 0) return baseElements;
@@ -3387,19 +3555,17 @@
     // Every exported slot gets its own case; contexts without one fall back to
     // the NEUTRAL `<name>_default` json (marker id 0) — never to a slot json,
     // whose v2 slot marker would leak that slot's Z scale into other contexts.
-    function buildDisplayContextModel(modelBaseName, exportedSlots) {
+    function buildDisplayContextModel(modelBaseName, exportedSlots, modelTransformation) {
         const tints = [{ type: 'minecraft:potion', default: -1 }];
         const ref = slot => `${EXPORT_NS}:item/${modelBaseName}_${slot}`;
-        const cases = (exportedSlots || DISPLAY_SLOTS)
-            .map(slot => ({
-                when: slot,
-                model: { type: 'minecraft:model', model: ref(slot), tints },
-            }));
-        const fallbackModel = {
-            type: 'minecraft:model',
-            model: ref('default'),
-            tints,
+        const modelFor = slot => {
+            const node = { type: 'minecraft:model', model: ref(slot), tints };
+            if (modelTransformation) node.transformation = modelTransformation;
+            return node;
         };
+        const cases = (exportedSlots || DISPLAY_SLOTS)
+            .map(slot => ({ when: slot, model: modelFor(slot) }));
+        const fallbackModel = modelFor('default');
         if (cases.length === 0) return fallbackModel;
         return {
             type: 'minecraft:select',
@@ -3414,7 +3580,7 @@
     // by modelBaseName, with a vanilla fallback. A second model on the same
     // baseItem coexists by adding another custom_model_data case (see merge in
     // saveSingleOutput).
-    function buildItemSelector(modelBaseName, exportedSlots, baseItem) {
+    function buildItemSelector(modelBaseName, exportedSlots, baseItem, modelTransformation) {
         const base = baseItem || 'iron_ingot';
         return {
             // MANDATORY: default `true` makes Minecraft replay the item-swap
@@ -3426,7 +3592,7 @@
                 property: 'minecraft:custom_model_data',
                 index: 0,
                 cases: [
-                    { when: modelBaseName, model: buildDisplayContextModel(modelBaseName, exportedSlots) },
+                    { when: modelBaseName, model: buildDisplayContextModel(modelBaseName, exportedSlots, modelTransformation) },
                 ],
                 fallback: { type: 'minecraft:model', model: `minecraft:item/${base}` },
             },
@@ -3479,8 +3645,8 @@
 
     // Merge a new model into an existing item definition: replace the case for
     // modelBaseName if present, else append it. Returns the merged object.
-    function mergeItemSelector(existing, modelBaseName, exportedSlots) {
-        const node = buildDisplayContextModel(modelBaseName, exportedSlots);
+    function mergeItemSelector(existing, modelBaseName, exportedSlots, modelTransformation) {
+        const node = buildDisplayContextModel(modelBaseName, exportedSlots, modelTransformation);
         const cases = existing.model.cases.filter(c => c.when !== modelBaseName);
         cases.push({ when: modelBaseName, model: node });
         existing.model.cases = cases;
@@ -3490,22 +3656,26 @@
         return existing;
     }
 
-    // assets/minecraft/atlases/blocks.json — ensures the objcubed item
-    // textures are stitched into the block atlas (the atlas the objmc shaders
-    // sample). A directory source with source 'item' picks up every
-    // assets/<ns>/textures/item/*.png across all namespaces and registers it as
-    // <ns>:item/<file>, which is exactly the ref buildSlotModelJson emits.
-    function buildBlocksAtlas() {
-        return { sources: [{ type: 'minecraft:directory', source: 'item', prefix: 'item/' }] };
+    // Add only exported obj³ textures to blocks.png. A broad `item/`
+    // directory source also captures every vanilla item and causes multi-atlas
+    // model-bake failures on 26.2.
+    function objCubedAtlasSource(modelName) {
+        const id = `${EXPORT_NS}:item/${modelName}`;
+        return { type: 'minecraft:single', resource: id, sprite: id };
     }
-
-    // Add (idempotently) the item directory source to an existing parsed atlas.
-    function mergeBlocksAtlas(existing) {
-        const sources = Array.isArray(existing.sources) ? existing.sources : [];
-        const has = sources.some(s => s &&
+    function buildBlocksAtlas(modelName) {
+        return { sources: [objCubedAtlasSource(modelName)] };
+    }
+    function mergeBlocksAtlas(existing, modelName) {
+        let sources = Array.isArray(existing.sources) ? existing.sources : [];
+        sources = sources.filter(s => !(s &&
             (s.type === 'minecraft:directory' || s.type === 'directory') &&
-            s.source === 'item' && (s.prefix === 'item/' || s.prefix === 'item'));
-        if (!has) sources.push({ type: 'minecraft:directory', source: 'item', prefix: 'item/' });
+            s.source === 'item' && (s.prefix === 'item/' || s.prefix === 'item')));
+        const source = objCubedAtlasSource(modelName);
+        const has = sources.some(s => s &&
+            (s.type === 'minecraft:single' || s.type === 'single') &&
+            s.resource === source.resource && (s.sprite || s.resource) === source.sprite);
+        if (!has) sources.push(source);
         existing.sources = sources;
         return existing;
     }
@@ -3551,13 +3721,15 @@
                        tr[0]===0 && tr[1]===0 && tr[2]===0 &&
                        s[0]===1 && s[1]===1 && s[2]===1;
             };
-            const exportedSlots = DISPLAY_SLOTS.filter(slot => {
-                if (slot === FALLBACK_SLOT) return true;
-                const off = SLOT_OFFSETS[slot] || { x:0, y:0, z:0 };
-                if (off.x !== 0 || off.y !== 0 || off.z !== 0) return true;
-                if (displayTransforms[slot] && !isIdentity(displayTransforms[slot])) return true;
-                return false;
-            });
+            const exportedSlots = result.staticSurface
+                ? DISPLAY_SLOTS.slice()
+                : DISPLAY_SLOTS.filter(slot => {
+                    if (slot === FALLBACK_SLOT) return true;
+                    const off = SLOT_OFFSETS[slot] || { x:0, y:0, z:0 };
+                    if (off.x !== 0 || off.y !== 0 || off.z !== 0) return true;
+                    if (displayTransforms[slot] && !isIdentity(displayTransforms[slot])) return true;
+                    return false;
+                });
 
             // Per-slot model JSONs → assets/objcubed/models/item/<modelName>_<slot>.json.
             //
@@ -3608,7 +3780,7 @@
                 fs.writeFileSync(
                     path.join(modelsDir, `${modelName}_${fileSlot}.json`),
                     buildSlotModelJson(modelName, fileSlot, slotDisplay,
-                        calibratedElementsForSlot(result.elements, displayLookupSlot, markerId)),
+                        calibratedElementsForSlot(result.elements, displayLookupSlot, markerId, result.staticSurface)),
                     'utf8'
                 );
             };
@@ -3629,15 +3801,15 @@
                 let existing = null;
                 try { existing = JSON.parse(fs.readFileSync(itemPath, 'utf8')); } catch (e) { existing = null; }
                 if (existing && isMergeableItemSelector(existing)) {
-                    itemObj = mergeItemSelector(existing, modelName, exportedSlots);
+                    itemObj = mergeItemSelector(existing, modelName, exportedSlots, result.staticModelTransformation);
                     // Keep vanilla fallback pointed at the requested base item.
                     itemObj.model.fallback = { type: 'minecraft:model', model: `minecraft:item/${baseItem}` };
                 } else {
                     try { fs.writeFileSync(itemPath + '.bak', fs.readFileSync(itemPath)); } catch (e) {}
-                    itemObj = buildItemSelector(modelName, exportedSlots, baseItem);
+                    itemObj = buildItemSelector(modelName, exportedSlots, baseItem, result.staticModelTransformation);
                 }
             } else {
-                itemObj = buildItemSelector(modelName, exportedSlots, baseItem);
+                itemObj = buildItemSelector(modelName, exportedSlots, baseItem, result.staticModelTransformation);
             }
             // Atomic write: this file aggregates EVERY model's custom_model_data case on
             // this base item, so a half-written/interrupted overwrite would destroy them
@@ -3665,9 +3837,9 @@
             if (fs.existsSync(blocksAtlasPath)) {
                 let existing = null;
                 try { existing = JSON.parse(fs.readFileSync(blocksAtlasPath, 'utf8')); } catch (e) { existing = null; }
-                atlasObj = (existing && typeof existing === 'object') ? mergeBlocksAtlas(existing) : buildBlocksAtlas();
+                atlasObj = (existing && typeof existing === 'object') ? mergeBlocksAtlas(existing, modelName) : buildBlocksAtlas(modelName);
             } else {
-                atlasObj = buildBlocksAtlas();
+                atlasObj = buildBlocksAtlas(modelName);
             }
             fs.writeFileSync(blocksAtlasPath, JSON.stringify(atlasObj, null, 2), 'utf8');
 
@@ -5238,6 +5410,9 @@
                                 scale:           +this.scale,
                                 offset:          [+this.offsetX, +this.offsetY, +this.offsetZ],
                                 animationEnabled: this.hasAnims && this.animationEnabled,
+                                // Backend is automatic; the UI and export flow stay unchanged.
+                                staticSurface: !(this.hasAnims && this.animationEnabled) && !this.exportAsEquipment
+                                    && !cbParts.includes('scale'),
                                 animationIndex:  +this.animationIndex,
                                 animFps:         +this.animFps,
                                 animStart:       +this.animStart,

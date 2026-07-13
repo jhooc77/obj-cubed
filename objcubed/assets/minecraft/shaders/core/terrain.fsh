@@ -1,5 +1,4 @@
-#version 150
-
+#version 410
 #moj_import <minecraft:fog.glsl>
 #moj_import <minecraft:globals.glsl>
 #moj_import <minecraft:chunksection.glsl>
@@ -17,6 +16,13 @@ in vec2 texCoord;
 in vec2 texCoord2;
 in vec3 Pos;
 in float transition;
+
+in vec2 ocSurfaceCoord;
+flat in vec4 ocSurfaceP01;
+flat in vec4 ocSurfaceP23;
+flat in vec4 ocSurfaceUV01;
+flat in vec4 ocSurfaceUV23;
+flat in vec4 ocSurfaceMap;
 
 flat in int isCustom;
 flat in int noshadow;
@@ -103,8 +109,21 @@ vec4 sampleColor(vec2 uv) {
     return UseRgss == 1 ? sampleRGSS(Sampler0, uv, 1.0f / TextureSize) : sampleNearest(Sampler0, uv, 1.0f / TextureSize);
 }
 
+#moj_import <objmc_static_fragment.glsl>
+
+// OC_HYBRID_SURFACE_PATCH_v1_2
 void main() {
-    vec4 color = mix(sampleColor(texCoord), sampleColor(texCoord2), transition);
+    vec4 color;
+    if (ocSurfaceMap.w > 0.5) {
+        vec2 ocLocalUv;
+        if (!ocResolveStaticUv(ocSurfaceCoord, ocSurfaceP01, ocSurfaceP23,
+                               ocSurfaceUV01, ocSurfaceUV23, ocSurfaceMap.z, ocLocalUv)) discard;
+        vec2 ocSample0 = texCoord  + ocLocalUv * ocSurfaceMap.xy;
+        vec2 ocSample1 = texCoord2 + ocLocalUv * ocSurfaceMap.xy;
+        color = mix(texture(Sampler0, ocSample0), texture(Sampler0, ocSample1), transition);
+    } else {
+        color = mix(sampleColor(texCoord), sampleColor(texCoord2), transition);
+    }
 
     //custom lighting
     #define BLOCK
