@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -59,6 +58,14 @@ if len(main_text.splitlines()) < 800:
     die("objmc_main.glsl looks truncated")
 if TAG not in plugin_text or TAG not in main_text:
     die("patch tag missing")
+if "OC_STATIC_META_STRIDE = 9" not in plugin_text:
+    die("surface-v4 compact metadata stride missing")
+prefix = main_text.split("#if OC_HAS_SUBGROUP", 1)[0]
+if "ivec4(12, 34, 57, 255)" not in prefix:
+    die("surface-v4 marker missing")
+for forbidden in ("getvert(", "getpos(", "getuv("):
+    if forbidden in prefix:
+        die(f"legacy data fetch remains in static-v4 path: {forbidden}")
 if "staticSurface: !(this.hasAnims" not in plugin_text:
     die("automatic static selection missing")
 if "!cbParts.includes('scale')" not in plugin_text:
@@ -92,9 +99,15 @@ for name in ("item", "entity", "block", "terrain"):
         die(f"{name}.fsh is not GLSL 410")
     if "objmc_static_fragment.glsl" not in ft:
         die(f"{name}.fsh lacks surface fragment helper")
+    if "transition > 0.0" not in ft or "texture(Sampler0, ocSample0)" not in ft:
+        die(f"{name}.fsh lacks the one-sample static fast path")
 
 manifest = json.loads((ROOT / "HYBRID_SURFACE_PATCH.json").read_text(encoding="utf-8"))
 if manifest.get("patch") != TAG:
     die("manifest patch version mismatch")
+if manifest.get("static_backend") != "surface-v4-compact-metadata":
+    die("manifest static backend mismatch")
+if manifest.get("static_legacy_streams") is not False:
+    die("manifest says static legacy streams are still enabled")
 
 print("actual checkout validation passed")
