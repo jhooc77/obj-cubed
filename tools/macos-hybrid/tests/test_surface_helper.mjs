@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
-const source = fs.readFileSync(path.join(root, 'src/static_surface_plugin.js'), 'utf8');
+const source = fs.readFileSync(path.join(root, 'src-v4/static_surface_plugin.js'), 'utf8');
 const build = new Function(`${source}\nreturn buildStaticSurfaceElements;`)();
 
 function rx(a) { const c=Math.cos(a),s=Math.sin(a); return [[1,0,0],[0,c,-s],[0,s,c]]; }
@@ -36,34 +36,27 @@ function elementVertices(el, modelTransformation) {
 }
 
 function runTriangle() {
-  const obj={
-    positions:[[0,0,0],[1,0,0],[0,1,0]],
-    faces:[[[0,0],[1,1],[2,2]]],
-  };
+  const obj={positions:[[0,0,0],[1,0,0],[0,1,0]],faces:[[[0,0],[1,1],[2,2]]]};
   const puts=[];
   const out=build(obj,indexedData(obj),{scale:1,offset:[0,0,0]},16,64,2,(...a)=>puts.push(a),[0]);
   assert.equal(out.elements.length,1);
-  assert.equal(out.modelTransformation, null);
-  assert.equal(puts.length,9);
-  // Face pointer plus 8 compact q16 point/UV texels.
+  assert.equal(out.modelTransformation,null);
+  assert.equal(puts.length,10);
   assert.deepEqual(puts[0],[0,2,0,0,0,2]);
+  // ids [0,1,2,2] -> owners0=5, owners1=4 -> packed=75.
+  assert.deepEqual(puts[1],[1,2,75,3,0,255]);
   const verts=elementVertices(out.elements[0],out.modelTransformation);
   const expected=[[1.5,0,0.5],[1.5,1,0.5],[0.5,1,0.5],[0.5,0,0.5]];
   verts.forEach((v,i)=>near(v,expected[i]));
 }
 
 function runTiltedQuad() {
-  const obj={
-    positions:[[0,0,0],[1,0,1],[1,1,1],[0,1,0]],
-    faces:[[[0,0],[1,1],[2,2],[3,3]]],
-  };
+  const obj={positions:[[0,0,0],[1,0,1],[1,1,1],[0,1,0]],faces:[[[0,0],[1,1],[2,2],[3,3]]]};
   const out=build(obj,indexedData(obj),{scale:0.75,offset:[0.1,-0.2,0.3]},32,128,2,()=>{},[12]);
   assert.equal(out.elements[0].light_emission,12);
   const verts=elementVertices(out.elements[0],out.modelTransformation);
-  const p0=[0.5+0.1, -0.2, 0.5+0.3];
-  const p1=[0.5+0.1+0.75, -0.2, 0.5+0.3+0.75];
-  const p3=[0.5+0.1, -0.2+0.75, 0.5+0.3];
-  const e1=sub(p1,p0), e2=sub(p3,p0);
+  const p0=[0.6,-0.2,0.8], p1=[1.35,-0.2,1.55], p3=[0.6,0.55,0.8];
+  const e1=sub(p1,p0),e2=sub(p3,p0);
   const n=[e1[1]*e2[2]-e1[2]*e2[1],e1[2]*e2[0]-e1[0]*e2[2],e1[0]*e2[1]-e1[1]*e2[0]];
   for(const p of verts) assert.ok(Math.abs(n[0]*(p[0]-p0[0])+n[1]*(p[1]-p0[1])+n[2]*(p[2]-p0[2]))<2e-5);
 }
@@ -73,16 +66,14 @@ function runMetadataWrap() {
   const puts=[];
   build(obj,indexedData(obj),{scale:1,offset:[0,0,0]},8,64,2,(...a)=>puts.push(a),[0]);
   assert.deepEqual(puts[0],[0,2,0,0,0,2]);
-  // Nine texels from linear 16..24: the final metadata texel wraps to row 3.
-  assert.deepEqual(puts.at(-1).slice(0,2),[0,3]);
+  // Linear texels 16..25 at width 8; the final texel wraps to x=1,row=3.
+  assert.deepEqual(puts.at(-1).slice(0,2),[1,3]);
 }
 
 function runOutOfRangeFallback() {
   const obj={positions:[[3,0,0],[4,0,0],[3,1,0]],faces:[[[0,0],[1,1],[2,2]]]};
-  assert.throws(
-    ()=>build(obj,indexedData(obj),{scale:1,offset:[0,0,0]},16,64,2,()=>{},[0]),
-    e => e && e.ocStaticFallback === true && /element range/.test(e.message)
-  );
+  assert.throws(()=>build(obj,indexedData(obj),{scale:1,offset:[0,0,0]},16,64,2,()=>{},[0]),
+    e=>e&&e.ocStaticFallback===true&&/element range/.test(e.message));
 }
 
 function runNonPlanarReject() {
@@ -95,4 +86,4 @@ runTiltedQuad();
 runMetadataWrap();
 runOutOfRangeFallback();
 runNonPlanarReject();
-console.log('Static surface-v4 helper geometry/metadata tests passed.');
+console.log('Static surface-v1.4 geometry/metadata tests passed.');
