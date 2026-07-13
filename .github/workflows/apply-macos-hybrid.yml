@@ -66,6 +66,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 tools/macos-hybrid/optimize_surface_v4.py .
+          # The validator evolves with the current branch; the deterministic base
+          # checkout above intentionally restores only the generator inputs.
           git checkout "$SOURCE_HEAD" -- tools/macos-hybrid/validate_actual.py
           # A second application must be a no-op apart from deterministic manifest writes.
           python3 tools/macos-hybrid/optimize_surface_v4.py .
@@ -86,6 +88,7 @@ jobs:
           ! sed '/#if OC_HAS_SUBGROUP/,$d' objcubed/assets/minecraft/shaders/include/objmc_main.glsl | grep -Eq 'getvert\(|getpos\(|getuv\('
           grep -q 'ocBarycentricOwned' objcubed/assets/minecraft/shaders/include/objmc_static_fragment.glsl
           grep -q 'ocPackedFlags' objcubed/assets/minecraft/shaders/include/objmc_main.glsl
+          grep -q 'ocCarrierOrigin = subgroupQuadBroadcast' objcubed/assets/minecraft/shaders/include/objmc_main.glsl
           grep -q 'vec4 ocColor0 = texture(Sampler0, ocSample0)' objcubed/assets/minecraft/shaders/core/item.fsh
 
       - name: Install upstream test dependencies
