@@ -1,0 +1,103 @@
+name: Apply macOS hybrid backend
+
+on:
+  push:
+    branches:
+      - agent/macos-hybrid-compat
+    paths:
+      - .github/workflows/apply-macos-hybrid.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/macos-hybrid-compat
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Materialize compatibility tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat tools/macos-hybrid-payload/part-*.b64 > /tmp/macos-hybrid-tools.tar.gz.b64
+          base64 -d /tmp/macos-hybrid-tools.tar.gz.b64 > /tmp/macos-hybrid-tools.tar.gz
+          echo '438ac872a1c5ea8dd4484811c4209d8804edc686ffebb85a83f5438dd3e91c7f  /tmp/macos-hybrid-tools.tar.gz' | sha256sum -c -
+          mkdir -p tools/macos-hybrid
+          tar -xzf /tmp/macos-hybrid-tools.tar.gz -C tools/macos-hybrid
+          rm -rf \
+            /tmp/macos-hybrid-tools.tar.gz \
+            /tmp/macos-hybrid-tools.tar.gz.b64 \
+            tools/macos-hybrid-payload \
+            tools/macos-hybrid-payload.tar.gz.b64
+
+      - name: Apply backend to the real checkout
+        run: python3 tools/macos-hybrid/install.py .
+
+      - name: Remove installer backups
+        run: find . -type f -name '*.pre-hybrid-surface' -delete
+
+      - name: Validate generated JavaScript and hybrid structure
+        run: |
+          node --check objcubed.js
+          python3 tools/macos-hybrid/validate_actual.py
+          python3 tools/macos-hybrid/tests/test_static_surface_math.py
+          node tools/macos-hybrid/tests/test_surface_helper.mjs
+
+      - name: Install upstream test dependencies
+        run: npm install --ignore-scripts --force
+
+      - name: Run upstream tests
+        run: |
+          npm test
+          npm run test:pack
+
+      - name: Build downloadable ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          zip -qr dist/obj-cubed-macos-hybrid.zip . \
+            -x '.git/*' 'node_modules/*' 'dist/*' '*.pre-hybrid-surface'
+          sha256sum dist/obj-cubed-macos-hybrid.zip > dist/obj-cubed-macos-hybrid.zip.sha256
+
+      - name: Upload patched repository ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: obj-cubed-macos-hybrid
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Commit generated source changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A \
+            objcubed.js \
+            objcubed \
+            HYBRID_SURFACE_PATCH.json \
+            tools/macos-hybrid \
+            tools/macos-hybrid-payload \
+            tools/macos-hybrid-payload.tar.gz.b64
+          if git diff --cached --quiet; then
+            echo 'No generated changes to commit.'
+            exit 0
+          fi
+          git commit -m 'Add macOS hybrid static-surface backend'
+          git push origin HEAD:agent/macos-hybrid-compat
